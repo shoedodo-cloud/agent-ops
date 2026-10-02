@@ -56,6 +56,13 @@ def test_skeleton_loads_from_an_extra_folder_and_works(tmp_path):
     assert tracker.post_note("website", "Wire the login form") == "https://example.com/issues/8"
     assert tracker.run.calls[0][:4] == ["gh", "issue", "create", "--label"]
 
+    # The default post_note titles the item with the first line only and keeps the whole text as the body.
+    text = "Wire the login form\nSession note: notes/sessions/a.md, main at abc1234"
+    tracker.post_note("website", text)
+    call = tracker.run.calls[-1]
+    assert call[call.index("--title") + 1] == "Wire the login form"
+    assert call[call.index("--body") + 1] == text
+
     tracker.run = FakeGh(returncode=1, stderr="not logged in")
     with pytest.raises(TrackerError, match="not logged in"):
         tracker.open_items("website")
@@ -97,3 +104,14 @@ def test_broken_adapters_raise_tracker_error(tmp_path):
         sh.load_tracker(config({"tracker": "noadapter"}), env, tmp_path)
     with pytest.raises(TrackerError, match="broken on import"):
         sh.load_tracker(config({"tracker": "boom"}), env, tmp_path)
+
+
+def test_default_item_line_shows_the_link_only_when_it_differs_from_the_id():
+    from trackers.base import Context, Tracker
+    tracker = Tracker({}, Context(Path(".")))
+    item = {"id": "#7", "title": "Fix it", "url": "https://example.com/issues/7", "state": "open"}
+    assert tracker.format_item(item) == "#7 [open] Fix it  https://example.com/issues/7"
+    assert tracker.format_item({**item, "id": "notes/ledger.md:3", "url": "notes/ledger.md:3"}) == \
+        "notes/ledger.md:3 [open] Fix it"
+    assert tracker.scope_label("website") == "website"
+    assert tracker.more_items_note() == ""

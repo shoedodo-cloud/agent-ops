@@ -130,6 +130,15 @@ def rel(path: Path, base: Path) -> str:
         return str(path)
 
 
+def rel_or_name(path: Path, base: Path) -> str:
+    """path relative to base when it is inside base, else only its file name.
+    For text that leaves the machine: it never carries an absolute path."""
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return path.name
+
+
 def newest_note(folder: Path) -> Optional[Path]:
     """Newest file under folder. A dated name (YYYY-MM-DD[_HHMM]...) beats mtime."""
     best: Optional[Path] = None
@@ -261,6 +270,25 @@ def resolve_since(explicit: Optional[str], env: Mapping[str, str], hook: Mapping
     return Since(when.isoformat(),
                  f"since {fmt_time(when)} (last 24 hours, session start time unknown and no earlier note)",
                  None)
+
+
+# ---------------------------------------------------------------- the next line --------
+PASS_FAIL_WORDS = {"pass", "passed", "fail", "failed"}
+
+
+def first_line_problem(line: str) -> str:
+    """Why a next line would be a bad first line for a tracker item, or "" when it reads fine.
+    It catches a pasted path, a markdown heading and a dump of test results."""
+    text = line.strip()
+    if text.startswith(("/", "~", "./", "../")):
+        return f"it starts with a path ({text.split()[0][:40]})"
+    if text.startswith("#"):
+        return "it starts with # (a markdown heading, not a sentence)"
+    words = [w.lower() for w in re.findall(r"[A-Za-z]+", text)]
+    hits = [w for w in words if w in PASS_FAIL_WORDS]
+    if hits and (len(words) == 1 or (len(hits) >= 2 and len(hits) * 2 >= len(words))):
+        return "it looks like a list of PASS/FAIL results"
+    return ""
 
 
 # ---------------------------------------------------------------- stdin ----------------

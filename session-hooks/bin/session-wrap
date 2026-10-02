@@ -23,10 +23,14 @@ read as a harness hook payload instead (its cwd and transcript_path are used).
 
 Tracker: without --post it only prints what it would send. With --post it sends the
 "Next session starts here" line to the configured tracker (a comment or a new item).
-Nothing is sent when there is no next line.
+Nothing is sent when there is no next line. What goes out is two lines: the next line,
+then "Session note: <path inside the repo, else the file name>, <branch> at <commit>".
+A new item is titled with the next line only (cut at 80 characters at a word boundary).
+No absolute path is ever sent. --post refuses, exit 1, when the next line starts with
+/, ~, ./, ../ or #, or looks like a list of PASS/FAIL results. --allow-raw sends it anyway.
 
 Exit status: 0 note written (or skipped by --skip-if-noted), 1 the note could not be
-written or --post failed, 2 bad command line.
+written or --post failed or was refused, 2 bad command line.
 
 Environment:
   SESSION_NOTES_DIR      notes folder, relative to the repo root (default notes/sessions)
@@ -138,6 +142,8 @@ def run(argv: list[str] | None = None, stdin=None) -> int:
     parser.add_argument("--skip-if-noted", action="store_true",
                         help="do nothing when a note was already written after the session start")
     parser.add_argument("--post", action="store_true", help="send the next line to the tracker (default: print only)")
+    parser.add_argument("--allow-raw", action="store_true",
+                        help="send the next line even when it starts with a path or # or reads like test output")
     args = parser.parse_args(argv)
 
     home = _module_home()
@@ -187,9 +193,10 @@ def run(argv: list[str] | None = None, stdin=None) -> int:
 
     changes, _ = _changes(sh, root, since)
     branch_text = "no git"
+    branch_name = None
     head = "no commit"
     if root is not None:
-        _, branch_text = sh.current_branch(root)
+        branch_name, branch_text = sh.current_branch(root)
         branch_text = branch_text or "unknown branch"
         head = sh.head_short(root)
     template, problem = _template(sh, config, base)
@@ -227,8 +234,21 @@ def run(argv: list[str] | None = None, stdin=None) -> int:
     if not next_text:
         print("tracker: nothing to send, the note has no next line")
         return 0
-    where = f"{sh.rel(path, base)}, {branch_text} at {head}"
-    message = f"{' '.join(next_text.split())} (session note: {where})"
+    next_line = " ".join(next_text.split())
+    problem = "" if args.allow_raw else sh.first_line_problem(next_line)
+    if problem and args.post:
+        print(f"tracker: NOT sent, the next line is the first line of the item and {problem}. "
+              "Reword it with --next, or pass --allow-raw", file=sys.stderr)
+        return 1
+    if root is None:
+        git_part = "no git repo"
+    elif branch_name:
+        git_part = f"{branch_name} at {head}"
+    elif branch_text.startswith("detached"):
+        git_part = branch_text
+    else:
+        git_part = f"{branch_text} at {head}"
+    message = f"{next_line}\nSession note: {sh.rel_or_name(path, base)}, {git_part}"
     try:
         tracker = sh.load_tracker(config, env, base)
         plan = tracker.plan_post(project)
@@ -237,7 +257,10 @@ def run(argv: list[str] | None = None, stdin=None) -> int:
         return 1 if args.post else 0
     if not args.post:
         print(f"tracker: would {plan}:")
-        print(f"  {message}")
+        for line in message.splitlines():
+            print(f"  {line}")
+        if problem:
+            print(f"tracker: --post would refuse, the next line {problem}. Reword it or pass --allow-raw")
         print("tracker: nothing sent (dry run). Add --post to send.")
         return 0
     try:
@@ -245,6 +268,8 @@ def run(argv: list[str] | None = None, stdin=None) -> int:
     except TrackerError as exc:
         print(f"tracker: NOT sent, {plan} failed: {exc}", file=sys.stderr)
         return 1
+    for warning in getattr(tracker, "warnings", []):
+        print(f"tracker: warning, {warning}")
     print(f"tracker: sent, {plan}: {url or '(no link returned)'}")
     return 0
 

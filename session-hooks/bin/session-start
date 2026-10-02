@@ -18,7 +18,8 @@ What it prints, each line either checked or marked "could not determine: <what> 
   uncommitted     number of paths in `git status --porcelain`
   last note       newest file under $SESSION_NOTES_DIR (default notes/sessions), its first
                   line, and its "Next session starts here" section
-  tracker         open items for this project from the configured tracker adapter
+  tracker         open items for this project from the configured tracker adapter, one line
+                  each. When the tracker has more than it returned, the count says "of more"
 
 It never merges, commits or writes a file. It talks to the network only for --fetch
 (one `git fetch` of the upstream remote) and for a tracker that lives online (Linear).
@@ -172,18 +173,19 @@ def _tracker_block(sh, out: Out, config, env, base: Path, project: str, max_item
     out.ok("tracker", f"{tracker.describe(project)}, {origin}")
     try:
         items = tracker.open_items(project)
+        lines = [tracker.format_item(item) for item in items[:max_items]]
+        more = tracker.more_items_note()
+        scope = tracker.scope_label(project)
     except TrackerError as exc:
         out.unknown("open tracker items", str(exc))
         return
     except Exception as exc:  # an adapter bug must not hide behind silence
         out.unknown("open tracker items", f"adapter error {type(exc).__name__}: {exc}")
         return
-    out.ok("open items", f"{len(items)} for {project}")
-    for item in items[:max_items]:
-        ident = item.get("id", "")
-        url = item.get("url", "")
-        tail = f"  {url}" if url and url != ident else ""
-        out.sub(f"- {ident} [{item.get('state', '')}] {item.get('title', '')}{tail}")
+    count = f"{len(items)} of more ({more})" if more else str(len(items))
+    out.ok("open items", f"{count} for {scope}")
+    for line in lines:
+        out.sub(f"- {line}")
     if len(items) > max_items:
         out.sub(f"... and {len(items) - max_items} more")
 

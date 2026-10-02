@@ -14,6 +14,11 @@ class Tracker:
     def open_items(self, project) -> list[Item]: ...     # Item = {id, title, url, state}
     def post_note(self, project, text) -> str: ...       # returns a URL or path:line
     def create_item(self, project, title, body) -> str: ...
+    # Optional, base class has defaults:
+    def scope_label(self, project) -> str: ...           # what the open-items count is about
+    def more_items_note(self) -> str: ...                # "" or why open_items stopped early
+    def format_item(self, item) -> str: ...              # the line session-start prints
+    warnings: list[str]                                  # printed after a post
 ```
 
 `context.repo_root` is the repo, `context.env` the environment. Read secrets from
@@ -22,7 +27,8 @@ answer. Never return an empty list to mean "I could not tell": session-start pri
 empty list as "0 open items", and a `TrackerError` as "could not determine".
 
 Only `open_items` runs at session start. `post_note` and `create_item` run only when the
-user passed `--post`. `post_note` defaults to opening a new item with `create_item`.
+user passed `--post`. `post_note` gets the next line, then a second line `Session note: ...`.
+It defaults to opening a new item with `create_item`, titled with the first line only.
 
 ## Skeleton: GitHub Issues with the `gh` CLI
 

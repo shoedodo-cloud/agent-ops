@@ -12,6 +12,9 @@
         "website": "Website"
       },
       "issue_id": "",
+      "states": ["In Progress", "Todo"],
+      "labels": [],
+      "state": "",
       "api_key_env": "LINEAR_API_KEY",
       "timeout_seconds": 10,
       "max_items": 50

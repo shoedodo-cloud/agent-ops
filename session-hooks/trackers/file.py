@@ -87,8 +87,12 @@ class FileTracker(Tracker):
         return items
 
     def post_note(self, project: str, text: str) -> str:
+        """The first line is the next line. Any later lines (the session note) go in brackets."""
+        head, _, rest = str(text).strip().partition("\n")
+        detail = _one_line(rest)
         today = dt.date.today().isoformat()
-        return self._append(project, f"Next session: {_one_line(text)} ({today})", [])
+        title = f"Next session: {_one_line(head)}" + (f" ({detail})" if detail else "")
+        return self._append(project, f"{title} ({today})", [])
 
     def create_item(self, project: str, title: str, body: str) -> str:
         return self._append(project, _one_line(title), str(body or "").splitlines())

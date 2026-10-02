@@ -113,7 +113,7 @@ def test_with_post_the_next_line_lands_in_the_ledger(repo):
     assert result.returncode == 0, result.stderr
     assert "tracker: sent" in result.stdout
     ledger = (repo / "notes" / "ledger.md").read_text()
-    assert "- [ ] (website) Next session: Wire the login form (session note: notes/sessions/" in ledger
+    assert "- [ ] (website) Next session: Wire the login form (Session note: notes/sessions/" in ledger
     start = run_cli("session-start", "--repo", repo).stdout
     assert "open items: 1 for website" in start
 

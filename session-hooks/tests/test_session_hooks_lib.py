@@ -112,3 +112,25 @@ def test_example_config_loads_both_adapters(tmp_path):
         plans[name] = tracker.plan_post("website")
     assert plans == {"file": "append an open item tagged (website) to notes/ledger.md",
                      "linear": "create a Linear issue in team ENG, project Website"}
+
+
+def test_rel_or_name_never_returns_an_absolute_path(tmp_path):
+    base = tmp_path / "repo"
+    assert sh.rel_or_name(base / "notes" / "a.md", base) == str(Path("notes") / "a.md")
+    assert sh.rel_or_name(tmp_path / "elsewhere" / "a.md", base) == "a.md"
+
+
+@pytest.mark.parametrize("line", [
+    "/home/alice/run.log", "~/work/todo.md", "./run.sh", "../other", "# Session note", "#42 fix it",
+    "PASS", "FAIL", "PASS PASS FAIL PASS", "PASS: 12 FAIL: 3", "pass, fail, pass", "PASS 12 FAIL 3 SKIP 1",
+])
+def test_first_line_problem_flags_unreadable_lines(line):
+    assert sh.first_line_problem(line) != ""
+
+
+@pytest.mark.parametrize("line", [
+    "Wire the login form", "Fix FAIL and PASS handling in the test report", "Skip the flaky test",
+    "Check ./config handling", "Passed the review, now merge it", "Add the /api/v2 route", "",
+])
+def test_first_line_problem_lets_readable_lines_through(line):
+    assert sh.first_line_problem(line) == ""

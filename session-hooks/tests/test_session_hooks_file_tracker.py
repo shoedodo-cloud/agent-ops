@@ -22,16 +22,20 @@ def test_round_trip(tmp_path):
 
     first = t.create_item("website", "Fix the flaky test", "seen twice\n- [ ] (website) not an item")
     before = dt.date.today().isoformat()
-    second = t.post_note("website", "Wire the\nlogin form")
+    second = t.post_note("website", "Wire the login form")
+    third = t.post_note("website", "Ship the footer\nSession note: notes/sessions/a.md, main at abc1234")
     after = dt.date.today().isoformat()          # two reads, so a midnight rollover cannot flake
     t.create_item("api", "Rotate the test keys", "")
 
     items = t.open_items("website")
     titles = [i["title"] for i in items]
-    assert len(titles) == 2 and titles[0] == "Fix the flaky test"
+    assert len(titles) == 3 and titles[0] == "Fix the flaky test"
     assert titles[1] in {f"Next session: Wire the login form ({d})" for d in (before, after)}
+    # The first line is the next line. Later lines are the session note, in brackets.
+    assert titles[2] in {f"Next session: Ship the footer (Session note: notes/sessions/a.md, main at abc1234) ({d})"
+                         for d in (before, after)}
     assert all(i["state"] == "open" for i in items)
-    assert [i["id"] for i in items] == [first, second]
+    assert [i["id"] for i in items] == [first, second, third]
 
     lines = (tmp_path / "notes" / "ledger.md").read_text().splitlines()
     number = int(first.rsplit(":", 1)[1])
