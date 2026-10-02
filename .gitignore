@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+*.token
+.DS_Store
+
+# never commit tokens, keys or snapshots of your own machine

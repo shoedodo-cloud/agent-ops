@@ -1,0 +1,638 @@
+#!/usr/bin/env python3
+"""job-health: three-state health for scheduled jobs.
+
+A job that runs every day can still be broken. A check that reads a fresh
+timestamp as success reports a dead backup as healthy for as long as the
+timestamp keeps moving. "I ran" is not "I worked".
+
+So every row here is one of three states, never two:
+
+    OK       ran recently AND reported success
+    FAILING  ran recently AND reported failure
+    STALE    did not run recently, or ran and reported nothing we can read
+
+STALE is not a softer FAILING and not a warmer OK. "Did not run" and "ran and
+broke" have different causes and different fixes. An unreadable outcome is
+STALE, never OK. A missing log is STALE, never OK. A probe that crashes, hangs
+or returns nonsense is STALE, never OK.
+
+The core is pure where it can be: every classifier takes text and returns a
+state, so it is testable without a schedule, a drive or a clock. The IO lives
+in probes, one file each, loaded by name from the bundled `probes/` folder and
+from any folder listed in $JOB_HEALTH_PROBES.
+"""
+
+import argparse
+import datetime
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+
+# Probes do `from job_health import Health, STALE, ...`. This file has no .py
+# extension, so register it under that name before any probe is loaded.
+if __name__ == "__main__" or "job_health" not in sys.modules:
+    sys.modules["job_health"] = sys.modules[__name__]
+
+VERSION = "1.0.0"
+
+OK = "OK"
+FAILING = "FAILING"
+STALE = "STALE"
+
+#: Worst first, so callers can sort and headline the top row.
+SEVERITY = {FAILING: 0, STALE: 1, OK: 2}
+
+DEFAULT_MAX_AGE_H = 24.0
+DEFAULT_TIMEOUT_S = 60.0
+
+
+class Health(NamedTuple):
+    """One row of the report. `outcome` is what the job SAID, close to verbatim."""
+    name: str
+    owner: str
+    state: str
+    age_h: Optional[float]
+    outcome: str
+    detail: str = ""
+
+    @property
+    def is_bad(self) -> bool:
+        return self.state != OK
+
+    def age_text(self) -> str:
+        if self.age_h is None:
+            return "never"
+        if self.age_h < 1:
+            return "%dm ago" % int(self.age_h * 60)
+        if self.age_h < 48:
+            return "%.0fh ago" % self.age_h
+        return "%.0fd ago" % (self.age_h / 24)
+
+
+# --------------------------------------------------------------------------
+# the pure core
+# --------------------------------------------------------------------------
+
+def classify(age_h: Optional[float], max_age_h: float, ok: Optional[bool]) -> str:
+    """The whole decision, in one place.
+
+    `ok is None` means "no outcome we could read". That is STALE, not OK.
+    A negative age (clock skew, bad parse) is STALE too.
+    """
+    if age_h is None or age_h < 0 or age_h > max_age_h:
+        return STALE
+    if ok is None:
+        return STALE
+    return OK if ok else FAILING
+
+
+def _age_hours(ts: Optional[datetime.datetime],
+               now: Optional[datetime.datetime] = None) -> Optional[float]:
+    if ts is None:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=datetime.timezone.utc)
+    return (now - ts).total_seconds() / 3600.0
+
+
+def last_nonempty(text: str) -> str:
+    lines = [l for l in (text or "").splitlines() if l.strip()]
+    return lines[-1] if lines else ""
+
+
+def last_stamped(text: str,
+                 ts_reader: Callable[[str], Optional[datetime.datetime]]) -> str:
+    """The most recent line that carries a timestamp.
+
+    Not the last line. Many jobs write a block per run: a stamped summary line,
+    then unstamped detail (a file list, a tool's own stderr). Reading only the
+    final line finds detail where a timestamp should be and reports a healthy
+    job as never run.
+    """
+    for line in reversed([l for l in (text or "").splitlines() if l.strip()]):
+        if ts_reader(line) is not None:
+            return line
+    return ""
+
+
+# -- timestamp readers. Each takes a line and returns an aware datetime or None.
+
+def ts_iso_z(line: str) -> Optional[datetime.datetime]:
+    """`2030-01-15T07:30:04Z copied=4 failed=0` (UTC, first word)."""
+    try:
+        return datetime.datetime.strptime(
+            line.split()[0], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except (ValueError, IndexError):
+        return None
+
+
+def ts_bracketed_iso(line: str) -> Optional[datetime.datetime]:
+    """`[2030-01-15T07:05:05+02:00] backup: ...`, offset optional.
+
+    A naive stamp is read as local time, not UTC. Getting that wrong is a
+    1 to 2 hour age error, enough to flip a borderline row. The whole bracket
+    goes to fromisoformat, so an offset or a Z both parse.
+    """
+    m = re.match(r"\[([^\]]+)\]", line or "")
+    if not m:
+        return None
+    raw = m.group(1).strip().replace("Z", "+00:00")   # 3.9's fromisoformat rejects Z
+    try:
+        ts = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.astimezone()
+
+
+def ts_space_local(line: str) -> Optional[datetime.datetime]:
+    """`2030-01-15 07:05:10 DONE ...` (local time)."""
+    m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line or "")
+    if not m:
+        return None
+    try:
+        naive = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return naive.astimezone()
+
+
+def ts_tm_path(path: str) -> Optional[datetime.datetime]:
+    """`.../2030-01-14-232710.backup`, what `tmutil latestbackup` prints (local time)."""
+    m = re.search(r"(\d{4}-\d{2}-\d{2})-(\d{2})(\d{2})(\d{2})", path or "")
+    if not m:
+        return None
+    try:
+        naive = datetime.datetime.strptime(
+            "%s %s:%s:%s" % (m.group(1), m.group(2), m.group(3), m.group(4)),
+            "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return naive.astimezone()
+
+
+def ts_auto(line: str) -> Optional[datetime.datetime]:
+    """Try the line formats in a fixed order: bracketed, ISO Z, space-separated."""
+    for reader in (ts_bracketed_iso, ts_iso_z, ts_space_local):
+        ts = reader(line)
+        if ts is not None:
+            return ts
+    return None
+
+
+#: Names a config file may use for `timestamp`.
+TS_READERS: Dict[str, Callable[[str], Optional[datetime.datetime]]] = {
+    "auto": ts_auto,
+    "iso_z": ts_iso_z,
+    "bracketed_iso": ts_bracketed_iso,
+    "space_local": ts_space_local,
+}
+
+
+# -- outcome readers. Each returns True / False / None (None = unreadable).
+
+def outcome_from_regex(ok_regex: Optional[str],
+                       fail_regex: Optional[str]) -> Callable[[str], Optional[bool]]:
+    """Build an outcome reader from two patterns.
+
+    The failure pattern is checked first, so a line that matches both is a
+    failure. A line that matches neither is None (unreadable), never True.
+    Raises re.error on a bad pattern.
+    """
+    ok_re = re.compile(ok_regex) if ok_regex else None
+    fail_re = re.compile(fail_regex) if fail_regex else None
+
+    def reader(line: str) -> Optional[bool]:
+        if not line:
+            return None
+        if fail_re is not None and fail_re.search(line):
+            return False
+        if ok_re is not None and ok_re.search(line):
+            return True
+        return None
+    return reader
+
+
+def health_from_log(name: str, owner: str, text: str, max_age_h: float,
+                    ts_reader: Callable[[str], Optional[datetime.datetime]],
+                    outcome_reader: Callable[[str], Optional[bool]],
+                    now: Optional[datetime.datetime] = None,
+                    detail: str = "",
+                    explain: Optional[Callable[[str], Optional[str]]] = None) -> Health:
+    """Read the most recent STAMPED line of a log and classify it.
+
+    Pure: text in, Health out. No file, no clock (pass `now`).
+
+    `explain` may name a known reason for an unreadable outcome ("drive not
+    attached"). It changes only the wording of the row, never the verdict.
+    Without one, an unreadable outcome keeps its blunt default wording.
+    """
+    line = last_stamped(text, ts_reader)
+    age = _age_hours(ts_reader(line), now)
+    ok = outcome_reader(line)
+    state = classify(age, max_age_h, ok)
+    outcome = line.strip()[:110] if line else "no log"
+    if ok is None and line:
+        why = (explain(line) if explain else None) or "no outcome could be read"
+        outcome += "   <- " + why
+    return Health(name, owner, state, age, outcome or "no log", detail)
+
+
+# --------------------------------------------------------------------------
+# git state: a stuck checkout cannot push, so it cannot report itself
+# --------------------------------------------------------------------------
+
+#: How long unpushed work may sit before it counts as stranded.
+UNPUSHED_MAX_H = 26.0
+
+
+def _git(repo: str, *args: str, timeout: int = 20) -> Tuple[int, str]:
+    """Run one git command in `repo`. Caller-set GIT_DIR and friends are
+    dropped, so a probe run from inside a git hook still looks at `repo`."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"      # a monitor must not take the index lock
+    try:
+        p = subprocess.run(["git", "-C", repo] + list(args), capture_output=True,
+                           timeout=timeout, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return -1, ""
+    return p.returncode, (p.stdout or b"").decode("utf-8", "replace").strip()
+
+
+def git_probe_line(repo: str) -> str:
+    """`rebase=0 merge=0 conflicts=0 ahead=N behind=N oldest=EPOCH`, or "".
+
+    "" means `repo` is not a git work tree or git could not run. Values git
+    could not supply come back as -1 (no upstream) or `?` (unknown), which
+    parse_git_probe() grades STALE rather than guessing.
+
+    `oldest` is the OLDEST unpushed commit, not the newest. Reading the newest
+    resets the age on every new commit, so on a repo that commits daily the
+    stranded-work alarm could never fire.
+    """
+    rc, gitdir = _git(repo, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not gitdir:
+        return ""
+    rebase = int(os.path.isdir(os.path.join(gitdir, "rebase-merge"))
+                 or os.path.isdir(os.path.join(gitdir, "rebase-apply")))
+    merge = int(os.path.isfile(os.path.join(gitdir, "MERGE_HEAD")))
+    rc, out = _git(repo, "diff", "--name-only", "--diff-filter=U")
+    conflicts = str(len([l for l in out.splitlines() if l.strip()])) if rc == 0 else "?"
+    rc, ahead = _git(repo, "rev-list", "--count", "@{u}..HEAD")
+    ahead = ahead if rc == 0 and ahead else "-1"
+    rc, behind = _git(repo, "rev-list", "--count", "HEAD..@{u}")
+    behind = behind if rc == 0 and behind else "-1"
+    rc, stamps = _git(repo, "log", "--format=%ct", "@{u}..HEAD")
+    lines = stamps.splitlines() if rc == 0 else []
+    oldest = lines[-1].strip() if lines else "0"
+    return "rebase=%d merge=%d conflicts=%s ahead=%s behind=%s oldest=%s" % (
+        rebase, merge, conflicts, ahead, behind, oldest)
+
+
+def parse_git_probe(text: str, now_epoch: Optional[float] = None,
+                    unpushed_max_h: float = UNPUSHED_MAX_H) -> Tuple[str, str]:
+    """(state, human summary) from the probe line. Pure: no repo needed.
+
+      * mid-rebase, mid-merge or unresolved conflicts -> FAILING. The checkout
+        is stuck and only a person can finish it.
+      * unpushed work older than the threshold -> FAILING. The commits exist
+        but nobody else can see them.
+      * behind -> not a fault. A machine that pulls by hand rests behind.
+        Reported, not graded.
+      * unparseable, unreachable or no upstream -> STALE.
+    """
+    if not text or "rebase=" not in text:
+        return STALE, ((text or "").strip()[:80] or "no answer from the probe")
+    f = dict(kv.split("=", 1) for kv in text.split() if "=" in kv)
+    try:
+        rebase, merge = f["rebase"] == "1", f["merge"] == "1"
+        conflicts = int(f["conflicts"])
+        ahead = int(f["ahead"])
+        behind = int(f["behind"])
+        oldest = float(f.get("oldest") or 0)
+    except (KeyError, ValueError):
+        return STALE, "probe output could not be parsed: %s" % text.strip()[:60]
+
+    if rebase or merge or conflicts:
+        what = "mid-rebase" if rebase else ("mid-merge" if merge else "conflicted")
+        return FAILING, ("STUCK %s, %d unresolved file(s), cannot push until a "
+                         "person finishes it" % (what, conflicts))
+    if ahead < 0 or behind < 0:
+        return STALE, "no upstream configured, or upstream unreadable"
+    if ahead and oldest:
+        if now_epoch is None:
+            now_epoch = datetime.datetime.now(datetime.timezone.utc).timestamp()
+        age_h = (now_epoch - oldest) / 3600.0
+        if age_h > unpushed_max_h:
+            return FAILING, ("%d commit(s) unpushed, oldest %.0fh old, work is "
+                             "stranded on this machine" % (ahead, age_h))
+        return OK, "%d commit(s) unpushed (%.0fh), %d behind" % (ahead, age_h, behind)
+    return OK, "clean, %d ahead / %d behind" % (ahead, behind)
+
+
+def probe_git(name: str, repo: str, unpushed_max_h: float = UNPUSHED_MAX_H,
+              now_epoch: Optional[float] = None) -> Health:
+    """One local checkout. Unreadable is STALE, never OK."""
+    if not os.path.isdir(repo):
+        return Health(name, "", STALE, None, "repo path not found: %s" % repo)
+    out = git_probe_line(repo)
+    if not out:
+        return Health(name, "", STALE, None,
+                      "not a git work tree, or git could not run: %s" % repo)
+    state, summary = parse_git_probe(out, now_epoch, unpushed_max_h)
+    # age 0.0, not None: this is a live check, done just now. None renders as
+    # "never", which would say the opposite of the truth.
+    return Health(name, "", state, 0.0, summary, "live check")
+
+
+# --------------------------------------------------------------------------
+# rendering
+# --------------------------------------------------------------------------
+
+def render(rows: List[Health]) -> List[str]:
+    """The markdown block. Written on every run, including the run where
+    everything is broken: a report that goes quiet when things break is the
+    failure this tool exists to remove."""
+    out = ["## Scheduled jobs", "",
+           "_OK = ran recently AND reported success. FAILING = ran and broke. "
+           "STALE = did not run, or reported nothing readable. "
+           "Unreadable is never OK._", "",
+           "| Job | Owner | Last run | Last outcome | Verdict |",
+           "|---|---|---|---|---|"]
+    for r in sorted(rows, key=lambda h: (SEVERITY[h.state], h.name)):
+        verdict = r.state if r.state == OK else "**%s**" % r.state
+        out.append("| `%s` | %s | %s | %s | %s |"
+                   % (r.name, r.owner, r.age_text(), r.outcome.replace("|", "\\|"), verdict))
+    return out
+
+
+def headline(rows: List[Health]) -> str:
+    """One bold line for the top of a report, or '' when everything is OK."""
+    bad = [r for r in rows if r.is_bad]
+    if not bad:
+        return ""
+    return "**%d job(s) not OK: %s**" % (
+        len(bad), ", ".join("%s %s" % (r.name, r.state) for r in
+                            sorted(bad, key=lambda h: SEVERITY[h.state])))
+
+
+# --------------------------------------------------------------------------
+# probes: loaded by name, one file each
+# --------------------------------------------------------------------------
+
+PROBE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class ProbeError(Exception):
+    """A probe could not be found or loaded."""
+
+
+class ConfigError(Exception):
+    """The config file is missing, unreadable, or lists nothing."""
+
+
+def bundled_probes_dir() -> str:
+    """`probes/` beside `bin/`, found through the script's real path, so a
+    symlink in ~/.local/bin still finds it."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                        "probes")
+
+
+def probe_dirs(env: Optional[Dict[str, str]] = None) -> List[str]:
+    """$JOB_HEALTH_PROBES folders first, in order, then the bundled folder.
+    The first folder holding `<name>.py` wins."""
+    env = os.environ if env is None else env
+    extra = [os.path.expanduser(d.strip())
+             for d in (env.get("JOB_HEALTH_PROBES") or "").split(":") if d.strip()]
+    return extra + [bundled_probes_dir()]
+
+
+def find_probe(name: str, dirs: Optional[List[str]] = None) -> str:
+    if not isinstance(name, str) or not PROBE_NAME_RE.match(name):
+        raise ProbeError("not a valid probe name: %r (letters, digits, _ only)" % (name,))
+    dirs = probe_dirs() if dirs is None else dirs
+    for d in dirs:
+        path = os.path.join(d, name + ".py")
+        if os.path.isfile(path):
+            return path
+    raise ProbeError("unknown probe %r (searched: %s)" % (name, ", ".join(dirs)))
+
+
+def load_probe_module(name: str, dirs: Optional[List[str]] = None):
+    """(module, path). Raises ProbeError, or whatever the probe file raises."""
+    path = find_probe(name, dirs)
+    modname = "job_health_probe_" + name
+    spec = importlib.util.spec_from_file_location(modname, path)
+    if spec is None or spec.loader is None:
+        raise ProbeError("cannot load probe file %s" % path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[modname] = mod
+    spec.loader.exec_module(mod)
+    if not callable(getattr(mod, "probe", None)):
+        raise ProbeError("probe file %s has no probe(job) function" % path)
+    return mod, path
+
+
+def _stale(name: str, owner: str, why: str) -> Health:
+    return Health(name, owner, STALE, None, why)
+
+
+def _call_with_timeout(fn: Callable[[dict], object], job: dict,
+                       timeout_s: float) -> Tuple[str, object]:
+    """('ok', result) | ('raised', exc) | ('timeout', None)."""
+    box: Dict[str, object] = {}
+
+    def target() -> None:
+        try:
+            box["result"] = fn(job)
+        except BaseException as e:                 # noqa: B902 (any crash is STALE)
+            box["error"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout_s)
+    if t.is_alive():
+        return "timeout", None
+    if "error" in box:
+        return "raised", box["error"]
+    return "ok", box.get("result")
+
+
+def _as_health(result: object) -> Optional[Health]:
+    if isinstance(result, Health):
+        return result
+    if isinstance(result, tuple) and getattr(result, "_fields", None) == Health._fields:
+        return Health(*result)
+    return None
+
+
+def run_job(job: object, dirs: Optional[List[str]] = None) -> Health:
+    """Run one configured job. Every path that cannot decide returns STALE
+    with the reason in the outcome column. Nothing here returns OK on its own."""
+    if not isinstance(job, dict):
+        return _stale("(bad entry)", "-", "config entry is not an object: %.60r" % (job,))
+    name = str(job.get("name") or "").strip()
+    owner = str(job.get("owner") or "-")
+    if not name:
+        return _stale("(unnamed)", owner, "config entry has no name")
+    probe_name = job.get("probe")
+    if not probe_name:
+        return _stale(name, owner, "no probe named for this job")
+    try:
+        mod, _path = load_probe_module(probe_name, dirs)
+    except ProbeError as e:
+        return _stale(name, owner, str(e))
+    except BaseException as e:                     # noqa: B902 (a broken file is STALE)
+        return _stale(name, owner, "probe %s failed to load: %s: %s"
+                      % (probe_name, type(e).__name__, str(e)[:120]))
+    try:
+        timeout_s = float(job.get("timeout_seconds", DEFAULT_TIMEOUT_S))
+    except (TypeError, ValueError):
+        timeout_s = DEFAULT_TIMEOUT_S
+    kind, result = _call_with_timeout(mod.probe, dict(job), timeout_s)
+    if kind == "timeout":
+        return _stale(name, owner, "probe %s gave no answer within %gs" % (probe_name, timeout_s))
+    if kind == "raised":
+        return _stale(name, owner, "probe %s raised %s: %s"
+                      % (probe_name, type(result).__name__, str(result)[:120]))
+    h = _as_health(result)
+    if h is None:
+        return _stale(name, owner, "probe %s returned %s, not a Health row"
+                      % (probe_name, type(result).__name__))
+    if h.state not in SEVERITY:
+        return _stale(name, owner, "probe %s returned unknown state %r" % (probe_name, h.state))
+    if h.age_h is not None and not isinstance(h.age_h, (int, float)):
+        return _stale(name, owner, "probe %s returned a non-numeric age" % probe_name)
+    return h._replace(name=name, owner=str(job.get("owner") or h.owner or "-"))
+
+
+def run_all(jobs: List[object], dirs: Optional[List[str]] = None) -> List[Health]:
+    rows, seen = [], set()
+    for job in jobs:
+        row = run_job(job, dirs)
+        if row.name in seen:
+            row = _stale(row.name, row.owner, "duplicate job name in config")
+        seen.add(row.name)
+        rows.append(row)
+    return rows
+
+
+# --------------------------------------------------------------------------
+# config and CLI
+# --------------------------------------------------------------------------
+
+def config_path(env: Optional[Dict[str, str]] = None) -> str:
+    env = os.environ if env is None else env
+    return os.path.expanduser(env.get("JOB_HEALTH_CONFIG")
+                              or os.path.join("~", ".config", "job-health", "jobs.json"))
+
+
+def load_config(path: str) -> List[object]:
+    if not os.path.isfile(path):
+        raise ConfigError("no config at %s (copy config.example.json there)" % path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ConfigError("cannot read config %s: %s" % (path, e))
+    if not isinstance(data, list):
+        raise ConfigError("config %s must be a JSON list of jobs" % path)
+    if not data:
+        raise ConfigError("config %s lists no jobs, so nothing is being watched" % path)
+    return data
+
+
+HELP_EPILOG = """\
+states:
+  OK        ran recently AND reported success
+  FAILING   ran recently AND reported failure
+  STALE     did not run recently, or ran and reported nothing readable
+
+exit codes:
+  0  every job OK
+  1  at least one job FAILING or STALE
+  2  config or usage error (also printed to stdout, so a report file shows it)
+
+environment:
+  JOB_HEALTH_CONFIG   config file (default ~/.config/job-health/jobs.json)
+  JOB_HEALTH_PROBES   extra probe folders, colon-separated, searched before
+                      the bundled probes/ folder
+
+config: a JSON list of jobs, each {"name", "probe", "max_age_hours", ...}.
+Bundled probes: log_file, git_repo, time_machine (macOS only).
+"""
+
+
+def _fail(msg: str) -> int:
+    print("**job-health could not run: %s**" % msg)
+    print("job-health: %s" % msg, file=sys.stderr)
+    return 2
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="job-health",
+        description="Three-state health (OK / FAILING / STALE) for scheduled jobs. "
+                    "A job whose outcome cannot be read is STALE, never OK.",
+        epilog=HELP_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--config", help="config file (overrides $JOB_HEALTH_CONFIG)")
+    ap.add_argument("--version", action="version", version="job-health " + VERSION)
+    sub = ap.add_subparsers(dest="cmd", metavar="command")
+    sub.add_parser("report", help="headline (if anything is not OK) and the markdown table")
+    sub.add_parser("headline", help="one line: the jobs not OK, or 'N job(s) OK'")
+    p = sub.add_parser("probe", help="run one job and print everything about it")
+    p.add_argument("name", help="the job's name in the config")
+    args = ap.parse_args(argv)
+    if not args.cmd:
+        ap.print_help()
+        return 2
+
+    path = os.path.expanduser(args.config) if args.config else config_path()
+    try:
+        jobs = load_config(path)
+    except ConfigError as e:
+        return _fail(str(e))
+
+    if args.cmd == "probe":
+        matches = [j for j in jobs if isinstance(j, dict) and j.get("name") == args.name]
+        if not matches:
+            names = [str(j.get("name")) for j in jobs if isinstance(j, dict)]
+            return _fail("no job named %r in %s (jobs: %s)"
+                         % (args.name, path, ", ".join(names) or "none"))
+        job = matches[0]
+        try:
+            source = find_probe(job.get("probe"))
+        except ProbeError as e:
+            source = "not found: %s" % e
+        row = run_job(job)
+        # Config keys only, never values: a custom probe's config may hold a token.
+        print("job:       %s" % row.name)
+        print("owner:     %s" % row.owner)
+        print("probe:     %s" % job.get("probe"))
+        print("source:    %s" % source)
+        print("config:    keys %s" % ", ".join(sorted(job.keys())))
+        print("verdict:   %s" % row.state)
+        print("last run:  %s" % row.age_text())
+        print("outcome:   %s" % row.outcome)
+        print("detail:    %s" % (row.detail or "-"))
+        return 0 if row.state == OK else 1
+
+    rows = run_all(jobs)
+    head = headline(rows)
+    if args.cmd == "headline":
+        print(head or "%d job(s) OK" % len(rows))
+    else:
+        if head:
+            print(head + "\n")
+        print("\n".join(render(rows)))
+    return 1 if any(r.is_bad for r in rows) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

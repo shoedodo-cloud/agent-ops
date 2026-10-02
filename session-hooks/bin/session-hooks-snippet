@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""session-hooks-snippet: print hook fragments that wire session-start and session-wrap into a harness."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+HELP = """\
+Print the hook fragments for session-start and session-wrap. It never edits a settings
+file: you read the fragment and merge it yourself.
+
+  --harness claude   Claude Code, for ~/.claude/settings.json or <repo>/.claude/settings.json
+  --harness codex    Codex, for ~/.codex/hooks.json
+  --harness generic  any harness that runs a shell command, plus two AGENTS.md lines
+  --harness all      all three (the default)
+
+--json prints the bare JSON of one harness (claude or codex), with no comment lines, so
+you can pipe it into a merge tool. The commands use absolute paths to this folder's bin/,
+or to --bin-dir when given.
+"""
+
+
+def _bin_dir(arg: str) -> Path:
+    if arg:
+        return Path(os.path.expanduser(arg)).resolve()
+    if os.environ.get("SESSION_HOOKS_HOME"):
+        return Path(os.path.expanduser(os.environ["SESSION_HOOKS_HOME"])).resolve() / "bin"
+    return Path(__file__).resolve().parent
+
+
+def claude_fragment(bin_dir: Path) -> dict:
+    start = shlex.quote(str(bin_dir / "session-start"))
+    wrap = shlex.quote(str(bin_dir / "session-wrap"))
+    return {
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command",
+                            "command": f'{start} --repo "$CLAUDE_PROJECT_DIR"'}]}
+            ],
+            "SessionEnd": [
+                {"hooks": [{"type": "command",
+                            "command": f'{wrap} --repo "$CLAUDE_PROJECT_DIR" --since-start --skip-if-noted',
+                            "timeout": 30}]}
+            ],
+        }
+    }
+
+
+def codex_fragment(bin_dir: Path) -> dict:
+    start = shlex.quote(str(bin_dir / "session-start"))
+    return {
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": start,
+                            "statusMessage": "session-start baseline"}]}
+            ]
+        }
+    }
+
+
+def claude_text(bin_dir: Path) -> str:
+    return "\n".join([
+        "# Claude Code: merge into ~/.claude/settings.json (all repos) or <repo>/.claude/settings.json.",
+        "# SessionStart: prints the baseline, and Claude Code adds hook stdout to the agent's context.",
+        "# SessionEnd: writes a stub note only if the agent did not run session-wrap itself.",
+        "#   (Stop is not used: it fires after every reply, which would write a note per turn.)",
+        json.dumps(claude_fragment(bin_dir), indent=2),
+    ])
+
+
+def codex_text(bin_dir: Path) -> str:
+    wrap = shlex.quote(str(bin_dir / "session-wrap"))
+    return "\n".join([
+        "# Codex: merge into ~/.codex/hooks.json.",
+        "# SessionStart: prints the baseline at the start of each session.",
+        "# Codex has no session-end event. Its Stop event fires after every turn, so wiring",
+        "# session-wrap to it would write a note per turn. Run session-wrap by hand at the end,",
+        "# or keep a make target like the one below the JSON.",
+        json.dumps(codex_fragment(bin_dir), indent=2),
+        "",
+        "# Makefile target (the recipe line starts with a tab):",
+        "wrap:",
+        f'\t{wrap} --next "$(NEXT)"',
+        '# usage: make wrap NEXT="Wire the login form to the API"',
+    ])
+
+
+def generic_text(bin_dir: Path) -> str:
+    start = shlex.quote(str(bin_dir / "session-start"))
+    wrap = shlex.quote(str(bin_dir / "session-wrap"))
+    return "\n".join([
+        "# Any harness that can run a shell command at session start or end:",
+        f"#   start: {start} --repo <repo>",
+        f"#   end:   {wrap} --repo <repo> --since-start --skip-if-noted",
+        "# Any harness that reads AGENTS.md (OpenCode, Codex and others): add these two lines.",
+        "At the start of a session, run `session-start` and read its output before you act.",
+        'Before you finish, run `session-wrap --next "<the first thing the next session should do>"`.',
+    ])
+
+
+def run(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="session-hooks-snippet", description=HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--harness", choices=["claude", "codex", "generic", "all"], default="all")
+    parser.add_argument("--json", action="store_true", help="bare JSON for one harness (claude or codex)")
+    parser.add_argument("--bin-dir", default="", help="folder that holds session-start and session-wrap")
+    args = parser.parse_args(argv)
+    bin_dir = _bin_dir(args.bin_dir)
+
+    if args.json:
+        if args.harness == "claude":
+            print(json.dumps(claude_fragment(bin_dir), indent=2))
+            return 0
+        if args.harness == "codex":
+            print(json.dumps(codex_fragment(bin_dir), indent=2))
+            return 0
+        parser.error("--json needs --harness claude or --harness codex")
+
+    blocks = {"claude": claude_text, "codex": codex_text, "generic": generic_text}
+    chosen = list(blocks) if args.harness == "all" else [args.harness]
+    print("\n\n".join(blocks[name](bin_dir) for name in chosen))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())

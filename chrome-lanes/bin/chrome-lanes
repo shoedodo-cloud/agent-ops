@@ -1,0 +1,1119 @@
+#!/usr/bin/env python3
+"""chrome-lanes: find a Chrome profile by name for Claude in Chrome, and give one
+agent session at a time the Chrome turn on this machine.
+
+Claude in Chrome shows each open Chrome profile as "Browser N", numbered by
+connection order. The numbers change at every restart. Each profile's extension
+storage keeps a persistent device id and the label typed at connect. This tool
+reads that storage (read-only, never touches Chrome's LOCK file) and maps
+device id -> profile dir -> profile name -> account -> label.
+
+Usage:
+  chrome-lanes list [--json] [--cached] [DEVICE_ID ...]
+        Every profile that has the extension. Scans Chrome now, or reads the
+        snapshot with --cached. DEVICE_IDs limit the output to those ids.
+  chrome-lanes lookup NAME [--cached]
+        Rows whose profile name, account or label contain NAME (any case).
+        NAME may also be a full device id, or MACHINE:NAME to pick one machine.
+  chrome-lanes snapshot [--peers]
+        Scan now and write the snapshot. --peers also fetches the profiles of
+        every machine in CHROME_LANES_HOSTS over ssh.
+  chrome-lanes claim NAME [--project P] [--ttl HOURS] [--wait SECONDS] [--force]
+        Take the Chrome turn for this session, in the one profile matching NAME.
+        The turn is machine-wide: a live lease of another session, in any
+        profile, means HELD (exit 4). --wait polls every 10 s until the turn is
+        free or the time is up. A holder idle for CHROME_LANES_STALE_MINUTES or
+        more is taken over without --force. --force takes over at once: use it
+        only when the user says so. The old holder's next browser call gets a
+        CHROME LEASE TAKEN OVER note from the guard.
+  chrome-lanes release NAME | --all [--force]
+        Drop this session's lease by name, or every lease it holds. A live lease
+        of another session is NOT YOURS (exit 4) unless --force.
+  chrome-lanes status
+        List every lease. Clears leases whose session is gone or whose TTL ran out.
+  chrome-lanes guard
+        Claude Code PreToolUse hook for the Claude in Chrome tools (hook JSON on
+        stdin). Stamps this session's leases with the time of use. Exits 2 once,
+        with a note on stderr, when another session took the turn. It never
+        blocks for any other reason.
+  chrome-lanes open NAME
+        Open a Chrome window in that profile. A closed profile cannot be selected.
+  chrome-lanes snippet
+        Print the Claude Code settings.json fragment (JSON on stdout, notes on
+        stderr). Nothing is written. Paste it yourself.
+
+  --pid N on claim and release sets the session pid by hand (scripts, tests).
+
+How a session is identified: $CLAUDE_PID when set (Claude Code sets it), else the
+first parent process that is not a shell.
+
+Environment (every default stated):
+  CHROME_LANES_HOME           state dir. Default ~/.config/chrome-lanes
+                              (snapshot.json, leases/, leases/taken/, peers/).
+                              Files are written mode 0600.
+  CHROME_LANES_MACHINE        this machine's name. Default: short hostname.
+  CHROME_LANES_PROFILE_ROOT   Chrome user data dir. Default on macOS
+                              ~/Library/Application Support/Google/Chrome, on Linux
+                              ~/.config/google-chrome, on Windows
+                              %LOCALAPPDATA%\\Google\\Chrome\\User Data.
+  CHROME_LANES_STALE_MINUTES  idle minutes before a holder is taken over. Default 15.
+  CHROME_LANES_EXTENSION_ID   extension id to read. Default: Claude in Chrome's
+                              Web Store id.
+  CHROME_LANES_CHROME_BIN     Chrome command for `open` on Linux. Default google-chrome.
+  CHROME_LANES_HOSTS          optional, several machines: "name=ssh-host,name=ssh-host".
+                              Unset (the default): nothing ever goes over ssh.
+
+Several machines (only when CHROME_LANES_HOSTS is set): a claim on a profile that
+lives on another machine also places a copy of the lease there, so sessions on
+that machine see HELD. The remote end runs this script's own source through
+`ssh HOST python3 -`, so nothing is installed there. A failed copy warns and never
+fails the claim. Leases from another machine are trusted until they expire
+(--ttl, default 4 h). The names must match each machine's CHROME_LANES_MACHINE.
+Plumbing for the remote end, not for hand use: lease-put JSON, lease-del ID,
+lease-taken JSON.
+
+Exit codes: 0 ok. 1 Chrome's profile list could not be read. 2 usage error, or
+a name or id that matches nothing or more than one row. 3 --cached and no
+snapshot. 4 HELD or NOT YOURS.
+"""
+import json
+import os
+import re
+import shlex
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+
+DEFAULT_EXT_ID = "fcoeoabgfenejglbffodgkkbkcdhcgfn"   # Claude in Chrome, Chrome Web Store
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+KEYS = (b"bridgeDeviceId", b"bridgeDisplayName")
+LEASE_TTL_HOURS = 4.0
+DEFAULT_STALE_MINUTES = 15
+GUARD_PASS = {"list_connected_browsers", "select_browser"}   # the recovery calls themselves
+CHROME_TOOLS = "mcp__claude-in-chrome__"
+
+_noted = set()
+
+
+def note_once(msg):
+    if msg not in _noted:
+        _noted.add(msg)
+        print(f"note: {msg}", file=sys.stderr)
+
+
+# ---------- configuration (read from the environment at call time) ----------
+
+def lanes_home():
+    return os.path.expanduser(os.environ.get("CHROME_LANES_HOME") or "~/.config/chrome-lanes")
+
+
+def snapshot_path():
+    return os.path.join(lanes_home(), "snapshot.json")
+
+
+def lease_dir():
+    return os.path.join(lanes_home(), "leases")
+
+
+def peers_dir():
+    return os.path.join(lanes_home(), "peers")
+
+
+def profile_root():
+    env = os.environ.get("CHROME_LANES_PROFILE_ROOT")
+    if env:
+        return os.path.expanduser(env)
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/Google/Chrome")
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.join(base, "Google", "Chrome", "User Data")
+    return os.path.expanduser("~/.config/google-chrome")
+
+
+def extension_id():
+    return os.environ.get("CHROME_LANES_EXTENSION_ID") or DEFAULT_EXT_ID
+
+
+def machine_name():
+    return os.environ.get("CHROME_LANES_MACHINE") or socket.gethostname().split(".")[0] or "unknown"
+
+
+def stale_minutes():
+    raw = os.environ.get("CHROME_LANES_STALE_MINUTES", "").strip()
+    if not raw:
+        return DEFAULT_STALE_MINUTES
+    try:
+        n = int(raw)
+        if n >= 1:
+            return n
+    except ValueError:
+        pass
+    note_once(f"CHROME_LANES_STALE_MINUTES={raw!r} is not a whole number >= 1, using {DEFAULT_STALE_MINUTES}")
+    return DEFAULT_STALE_MINUTES
+
+
+class NoSnapshot(Exception):
+    """load_rows(cached=True) found no readable snapshot."""
+
+
+# ---------- LevelDB primitives (read-only) ----------
+
+def varint(b, p):
+    n = shift = 0
+    while True:
+        c = b[p]; p += 1
+        n |= (c & 0x7F) << shift; shift += 7
+        if not c & 0x80:
+            return n, p
+
+
+def snappy_decompress(b):
+    """Small raw-format snappy decompressor."""
+    n, i = varint(b, 0)
+    out = bytearray()
+    while i < len(b):
+        tag = b[i]; i += 1
+        t = tag & 3
+        if t == 0:                                  # literal
+            ln = tag >> 2
+            if ln < 60:
+                ln += 1
+            else:
+                nb = ln - 59
+                ln = int.from_bytes(b[i:i + nb], "little") + 1; i += nb
+            out += b[i:i + ln]; i += ln
+        else:                                       # copy
+            if t == 1:
+                ln = ((tag >> 2) & 7) + 4
+                off = ((tag >> 5) << 8) | b[i]; i += 1
+            elif t == 2:
+                ln = (tag >> 2) + 1
+                off = int.from_bytes(b[i:i + 2], "little"); i += 2
+            else:
+                ln = (tag >> 2) + 1
+                off = int.from_bytes(b[i:i + 4], "little"); i += 4
+            if off == 0 or off > len(out):
+                raise ValueError("bad snappy copy offset")
+            for _ in range(ln):
+                out.append(out[-off])
+    if len(out) != n:
+        raise ValueError("snappy length mismatch")
+    return bytes(out)
+
+
+def block_entries(data):
+    """Yield (key, value) from a LevelDB block (prefix-compressed entries + restart array)."""
+    nrestarts = int.from_bytes(data[-4:], "little")
+    end = len(data) - 4 - 4 * nrestarts
+    p, key = 0, b""
+    while p < end:
+        shared, p = varint(data, p)
+        nonshared, p = varint(data, p)
+        vlen, p = varint(data, p)
+        key = key[:shared] + data[p:p + nonshared]; p += nonshared
+        yield key, data[p:p + vlen]; p += vlen
+
+
+def read_block(f, off, size):
+    data = f[off:off + size]
+    return snappy_decompress(data) if f[off + size] == 1 else data
+
+
+def ldb_entries(f):
+    """Yield (user_key, seq, type, value) from an SSTable file's bytes."""
+    if len(f) < 48 or f[-8:] != bytes.fromhex("57fb808b247547db"):
+        raise ValueError("not an ldb file")
+    footer = f[-48:]
+    _, p = varint(footer, 0); _, p = varint(footer, p)          # metaindex handle
+    ioff, p = varint(footer, p); isize, p = varint(footer, p)   # index handle
+    for _, handle in block_entries(read_block(f, ioff, isize)):
+        off, q = varint(handle, 0); size, q = varint(handle, q)
+        for ikey, val in block_entries(read_block(f, off, size)):
+            trailer = int.from_bytes(ikey[-8:], "little")
+            yield ikey[:-8], trailer >> 8, trailer & 0xFF, val
+
+
+def log_entries(f):
+    """Yield (user_key, seq, type, value) from a LevelDB write-ahead log's bytes."""
+    BLOCK = 32768
+    records, buf, p = [], b"", 0
+    while p + 7 <= len(f):
+        if BLOCK - (p % BLOCK) < 7:                 # trailer padding
+            p += BLOCK - (p % BLOCK); continue
+        ln = int.from_bytes(f[p + 4:p + 6], "little"); rtype = f[p + 6]
+        payload = f[p + 7:p + 7 + ln]; p += 7 + ln
+        if rtype == 1:
+            records.append(payload)
+        elif rtype == 2:
+            buf = payload
+        elif rtype == 3:
+            buf += payload
+        elif rtype == 4:
+            records.append(buf + payload); buf = b""
+    for rec in records:
+        if len(rec) < 12:
+            continue
+        seq = int.from_bytes(rec[:8], "little"); count = int.from_bytes(rec[8:12], "little")
+        q = 12
+        for i in range(count):
+            if q >= len(rec):
+                break
+            t = rec[q]; q += 1
+            klen, q = varint(rec, q); key = rec[q:q + klen]; q += klen
+            val = b""
+            if t == 1:
+                vlen, q = varint(rec, q); val = rec[q:q + vlen]; q += vlen
+            yield key, seq + i, t, val
+
+
+def latest_values(directory, wanted, errors=None):
+    """Highest-sequence value for each wanted key across .ldb and .log files. None if deleted or
+    never written. Files that cannot be parsed are skipped and their names appended to errors."""
+    best = {}
+    for name in os.listdir(directory):
+        try:
+            with open(os.path.join(directory, name), "rb") as fh:
+                f = fh.read()
+            it = ldb_entries(f) if name.endswith(".ldb") else log_entries(f) if name.endswith(".log") else ()
+            for key, seq, t, val in it:
+                if key in wanted and seq >= best.get(key, (-1, None))[0]:
+                    best[key] = (seq, val if t == 1 else None)
+        except (ValueError, IndexError, struct.error, OSError):
+            if errors is not None:                      # unreadable file: skip, keep going, say so
+                errors.append(name)
+    out = {}
+    for key in wanted:
+        val = best.get(key, (-1, None))[1]
+        if val is None:
+            out[key] = None; continue
+        try:
+            out[key] = json.loads(val.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            out[key] = val.decode("utf-8", "replace")
+    return out
+
+
+# ---------- Chrome side ----------
+
+def profiles():
+    with open(os.path.join(profile_root(), "Local State"), "rb") as f:
+        info = json.load(f)["profile"]["info_cache"]
+    return {d: (v.get("name", "?"), v.get("user_name", "")) for d, v in info.items()}
+
+
+def scan():
+    root, ext = profile_root(), extension_id()
+    rows = []
+    for pdir, (pname, account) in sorted(profiles().items()):
+        d = os.path.join(root, pdir, "Local Extension Settings", ext)
+        if not os.path.isdir(d):
+            continue
+        errors = []
+        vals = latest_values(d, KEYS, errors)
+        row = {"deviceId": vals[b"bridgeDeviceId"], "profileDir": pdir, "profileName": pname,
+               "account": account, "label": vals[b"bridgeDisplayName"]}
+        if errors:
+            row["unreadable"] = len(errors)     # files skipped: a missing id may be "could not tell"
+        rows.append(row)
+    return rows
+
+
+def no_id_text(row):
+    if row.get("unreadable"):
+        return f"(unreadable storage, {row['unreadable']} files)"
+    return "(never connected)"
+
+
+# ---------- snapshot ----------
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _atomic_json(path, data):
+    """Write JSON via a temp file and os.replace. mkstemp makes the file mode 0600."""
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".chrome-lanes-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_snapshot(rows):
+    machine = machine_name()
+    data = {"machine": machine, "written": now_iso(),
+            "browsers": [dict(r, machine=machine) for r in rows]}
+    _atomic_json(snapshot_path(), data)
+    return data
+
+
+def load_rows(cached):
+    """Live scan (cached=False) or the snapshot plus peer snapshots (cached=True).
+    Raises NoSnapshot when cached and the snapshot is missing or unreadable."""
+    if not cached:
+        m = machine_name()
+        return [dict(r, machine=m) for r in scan()]
+    try:
+        with open(snapshot_path()) as f:
+            data = json.load(f)
+        rows = [dict(r, machine=r.get("machine") or data.get("machine")) for r in data["browsers"]]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise NoSnapshot()
+    return rows + peer_rows({r["deviceId"] for r in rows if r.get("deviceId")})
+
+
+def rows_or_scan():
+    """Snapshot rows, or a live scan when there is no snapshot. None (and a message) if neither."""
+    try:
+        return load_rows(cached=True)
+    except NoSnapshot:
+        pass
+    try:
+        return load_rows(cached=False)
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"cannot read Chrome's profile list under {profile_root()} ({e})", file=sys.stderr)
+        return None
+
+
+def find_by_name(rows, q):
+    """Rows whose profileName, account or label contain q (any case). A full device id matches
+    that row exactly. `machine:name` keeps only rows of that machine, then matches name."""
+    q = q.strip()
+    by_id = [r for r in rows if (r.get("deviceId") or "").lower() == q.lower()]
+    if by_id:
+        return by_id
+    machine = None
+    if ":" in q:
+        head, rest = q.split(":", 1)
+        if head and rest and any((r.get("machine") or "").lower() == head.lower() for r in rows):
+            machine, q = head.lower(), rest
+    q = q.lower()
+    return [r for r in rows
+            if (machine is None or (r.get("machine") or "").lower() == machine)
+            and any(q in (r.get(k) or "").lower() for k in ("profileName", "account", "label"))]
+
+
+def one_row(rows, name):
+    """The single row for name, or None after printing NO MATCH / AMBIGUOUS."""
+    hits = find_by_name(rows, name)
+    if len(hits) == 1:
+        return hits[0]
+    kind = "NO MATCH" if not hits else "AMBIGUOUS"
+    print(f"{kind} for {name!r} ({len(hits)} rows). Try a longer name, MACHINE:NAME or the device id.",
+          file=sys.stderr)
+    return None
+
+
+# ---------- leases ----------
+
+def session_pid():
+    """The pid that identifies this session across commands. Each Bash call of an agent is a
+    fresh shell, so the parent pid changes per command. $CLAUDE_PID wins when set. Otherwise
+    walk up past shells to the first non-shell ancestor (terminal, sshd, tmux, the agent)."""
+    env = os.environ.get("CLAUDE_PID", "")
+    if env.isdigit():
+        return int(env)
+    pid = os.getppid()
+    shells = {"zsh", "bash", "sh", "-zsh", "-bash", "-sh", "fish", "dash"}
+    for _ in range(5):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                                 capture_output=True, text=True, timeout=5).stdout.split(None, 1)
+            ppid, comm = int(out[0]), os.path.basename(out[1].strip()) if len(out) > 1 else ""
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            return pid
+        if comm not in shells or ppid <= 1:
+            return pid
+        pid = ppid
+    return pid
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if sys.platform == "win32":          # os.kill(pid, 0) would terminate the process on Windows
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)      # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+        k.CloseHandle(h)
+        return bool(ok) and code.value == 259      # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def lease_alive(lease):
+    """A lease from this machine (or with no machine field) is alive while its pid is. A lease
+    from another machine cannot be pid-checked here, so it is trusted until it expires."""
+    machine = lease.get("machine")
+    if not machine or machine == machine_name():
+        return pid_alive(lease.get("pid"))
+    try:
+        exp = datetime.fromisoformat(lease.get("expires") or "")
+    except (TypeError, ValueError):
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) < exp
+
+
+def lease_path(device_id):
+    if not isinstance(device_id, str) or not SAFE_ID.fullmatch(device_id):
+        raise ValueError(f"unsafe device id {device_id!r}")
+    return os.path.join(lease_dir(), f"{device_id}.json")
+
+
+def write_lease(lease):
+    _atomic_json(lease_path(lease.get("deviceId")), lease)
+
+
+def read_lease(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (ValueError, OSError):
+        return None
+
+
+def lease_files():
+    """Every readable lease on this machine, as (path, lease)."""
+    d = lease_dir()
+    if not os.path.isdir(d):
+        return []
+    found = []
+    for fname in sorted(os.listdir(d)):
+        if fname.endswith(".json") and not fname.startswith("."):
+            lease = read_lease(os.path.join(d, fname))
+            if lease:
+                found.append((os.path.join(d, fname), lease))
+    return found
+
+
+def is_mine(lease, pid):
+    return lease.get("pid") == pid and (lease.get("machine") or machine_name()) == machine_name()
+
+
+def idle_minutes(lease):
+    stamp = lease.get("last_used") or lease.get("since")
+    try:
+        return int((datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds() // 60)
+    except (TypeError, ValueError):
+        return stale_minutes()          # unreadable stamp counts as stuck, so it cannot hold forever
+
+
+def idle_text(lease):
+    stamp = lease.get("last_used") or lease.get("since")
+    try:
+        mins = int((datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds() // 60)
+    except (TypeError, ValueError):
+        return "idle unknown"
+    return f"idle {mins // 60}h {mins % 60:02d}m" if mins >= 60 else f"idle {mins}m"
+
+
+class OptError(Exception):
+    pass
+
+
+def _opt(argv, i, conv):
+    """Value for the option at argv[i]. OptError with a usable message when missing or bad."""
+    if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+        raise OptError(f"{argv[i]} needs a value")
+    try:
+        return conv(argv[i + 1])
+    except ValueError:
+        raise OptError(f"{argv[i]} got {argv[i + 1]!r}, expected a number")
+
+
+def cmd_claim(argv):
+    wait_s = 0.0
+    if "--wait" in argv:
+        j = argv.index("--wait")
+        try:
+            wait_s = _opt(argv, j, float)
+        except OptError as e:
+            print(f"claim: {e}", file=sys.stderr)
+            return 2
+        argv = argv[:j] + argv[j + 2:]
+    if wait_s <= 0:
+        return _claim_once(argv)
+    deadline, n = time.time() + wait_s, 0
+    while True:
+        rc = _claim_once(argv)
+        if rc != 4 or time.time() >= deadline:
+            return rc
+        n += 1
+        if n % 6 == 1:
+            print(f"waiting for the Chrome turn ({int(deadline - time.time())} s left)", file=sys.stderr)
+        time.sleep(10)
+
+
+def _claim_once(argv):
+    project, pid_override, ttl_hours, force, positional, i = None, None, LEASE_TTL_HOURS, False, [], 0
+    try:
+        while i < len(argv):
+            a = argv[i]
+            if a == "--project":
+                project = _opt(argv, i, str); i += 2
+            elif a == "--pid":
+                pid_override = _opt(argv, i, int); i += 2
+            elif a == "--ttl":
+                ttl_hours = _opt(argv, i, float); i += 2
+            elif a == "--force":
+                force = True; i += 1
+            else:
+                positional.append(a); i += 1
+    except OptError as e:
+        print(f"claim: {e}", file=sys.stderr)
+        return 2
+    if not positional:
+        print("claim: NAME required", file=sys.stderr)
+        return 2
+    name = positional[0]
+    rows = rows_or_scan()
+    if rows is None:
+        return 1
+    row = one_row(rows, name)
+    if row is None:
+        return 2
+    device_id = row.get("deviceId")
+    if not device_id:
+        print(f"{row.get('profileName')} has no device id: {no_id_text(row)}", file=sys.stderr)
+        return 2
+
+    my_pid = pid_override if pid_override is not None else session_pid()
+    if project is None:
+        project = os.path.basename(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+
+    # The turn is machine-wide: the selected browser is shared by every agent session on this
+    # machine, so two sessions in two different profiles still flip each other's target.
+    limit = stale_minutes()
+    for opath, other in lease_files():
+        if is_mine(other, my_pid) or not lease_alive(other):
+            continue
+        idle, take = idle_text(other), force
+        if not take and idle_minutes(other) >= limit:
+            take = True; idle += f", over the {limit} min stuck threshold"
+        if not take:
+            print(f"HELD: the Chrome turn on this machine belongs to pid {other.get('pid')}, project "
+                  f"{other.get('project')}, in {other.get('profileName')} since {other.get('since')} "
+                  f"({idle}). One session drives Chrome at a time. Wait (`chrome-lanes claim {name!r} "
+                  f"--wait 600`), do other work, or ask the user. Use --force only if the user says so.",
+                  file=sys.stderr)
+            return 4
+        print(f"TAKEN OVER the Chrome turn from pid {other.get('pid')}, project {other.get('project')} "
+              f"({other.get('profileName')}, {idle})", file=sys.stderr)
+        _mark_taken(other, my_pid, project)
+        try:
+            os.remove(opath)
+        except OSError:
+            pass
+        delete_remote_lease(other)
+
+    now = datetime.now(timezone.utc)
+    lease = {"deviceId": device_id, "profileName": row.get("profileName"), "pid": my_pid,
+             "project": project, "since": now.isoformat(), "last_used": now.isoformat(),
+             "machine": machine_name(), "expires": (now + timedelta(hours=ttl_hours)).isoformat()}
+    write_lease(lease)
+    print(f"claimed: {row.get('profileName')} {device_id} pid {my_pid}")
+    place_remote_lease(row, lease)
+    try:
+        write_snapshot(scan())
+    except Exception:
+        pass        # a claim never fails because the snapshot refresh could not be written
+    return 0
+
+
+def cmd_release(argv):
+    all_flag, force, pid_override, positional, i = False, False, None, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--all":
+            all_flag = True; i += 1
+        elif a == "--force":
+            force = True; i += 1
+        elif a == "--pid":
+            try:
+                pid_override = _opt(argv, i, int); i += 2
+            except OptError as e:
+                print(f"release: {e}", file=sys.stderr)
+                return 2
+        else:
+            positional.append(a); i += 1
+    my_pid = pid_override if pid_override is not None else session_pid()
+
+    if all_flag:
+        released = 0
+        for path, lease in lease_files():
+            if is_mine(lease, my_pid):
+                os.remove(path)
+                released += 1
+                print(f"released: {lease.get('profileName')} {lease.get('deviceId')}")
+                delete_remote_lease(lease)
+        if not released:
+            print(f"release: no lease held by pid {my_pid} on {machine_name()}")
+        return 0
+
+    if not positional:
+        print("release: NAME or --all required", file=sys.stderr)
+        return 2
+    name = positional[0]
+    rows = rows_or_scan()
+    if rows is None:
+        return 1
+    row = one_row(rows, name)
+    if row is None:
+        return 2
+    device_id = row.get("deviceId")
+    path = lease_path(device_id) if device_id else None
+    if not path or not os.path.exists(path):
+        print(f"release: {row.get('profileName')} has no lease")
+        return 0
+    lease = read_lease(path)
+    if lease and not is_mine(lease, my_pid) and lease_alive(lease) and not force:
+        print(f"NOT YOURS: {row.get('profileName')} is held by pid {lease.get('pid')}, project "
+              f"{lease.get('project')}, from {lease.get('machine') or machine_name()} ({idle_text(lease)}). "
+              f"A live lease is released by its holder. Use `release {name!r} --force` only if the user "
+              f"says so.", file=sys.stderr)
+        return 4
+    os.remove(path)
+    print(f"released: {row.get('profileName')} {device_id}")
+    if lease:
+        delete_remote_lease(lease)
+    return 0
+
+
+def cmd_status(argv):
+    leases = lease_files()
+    if not leases:
+        print("no leases")
+        return 0
+    for path, lease in leases:
+        machine = lease.get("machine")
+        remote = bool(machine) and machine != machine_name()
+        label = f"{lease.get('profileName')} {lease.get('deviceId')}"
+        if not lease_alive(lease):
+            os.remove(path)
+            if remote:
+                print(f"cleared expired lease: {label} from {machine} expires {lease.get('expires')}")
+            else:
+                print(f"cleared dead lease: {label} pid {lease.get('pid')}")
+            continue
+        if remote:
+            print(f"{label} held from {machine} expires {lease.get('expires')} "
+                  f"project {lease.get('project')} since {lease.get('since')}")
+        else:
+            print(f"{label} pid {lease.get('pid')} alive project {lease.get('project')} "
+                  f"since {lease.get('since')} ({idle_text(lease)})")
+    return 0
+
+
+def chrome_open_command(pdir):
+    flag = f"--profile-directory={pdir}"
+    if sys.platform == "darwin":
+        return ["open", "-na", "Google Chrome", "--args", flag]
+    if sys.platform == "win32":
+        return ["cmd", "/c", "start", "", "chrome", flag]
+    return [os.environ.get("CHROME_LANES_CHROME_BIN") or "google-chrome", flag]
+
+
+def cmd_open(argv):
+    if not argv:
+        print("open: NAME required", file=sys.stderr)
+        return 2
+    rows = rows_or_scan()
+    if rows is None:
+        return 1
+    row = one_row(rows, argv[0])
+    if row is None:
+        return 2
+    if (row.get("machine") or machine_name()) != machine_name():
+        print(f"open: {row.get('profileName')} lives on {row.get('machine')}, not on this machine",
+              file=sys.stderr)
+        return 2
+    cmd = chrome_open_command(row["profileDir"])
+    try:
+        if sys.platform == "darwin":
+            rc = subprocess.call(cmd)
+        else:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=(sys.platform != "win32"))
+            rc = 0
+    except OSError as e:
+        print(f"open failed for {row['profileDir']}: {e}", file=sys.stderr)
+        return 1
+    if rc != 0:
+        print(f"open failed (exit {rc}) for {row['profileDir']}", file=sys.stderr)
+        return 1
+    print(f"opened: {row['profileName']} ({row['profileDir']}). "
+          f"Call list_connected_browsers again in a few seconds.")
+    return 0
+
+
+# ---------- guard (PreToolUse hook) and takeover marker ----------
+
+def write_taken_marker(info):
+    pid = info.get("pid")
+    if not isinstance(pid, int):
+        raise ValueError(f"taken marker needs an integer pid, got {pid!r}")
+    _atomic_json(os.path.join(lease_dir(), "taken", f"{pid}.json"), info)
+
+
+def _mark_taken(old, by_pid, by_project):
+    """Leave the marker the old holder's guard turns into a TAKEN OVER note."""
+    info = {"pid": old.get("pid"), "profileName": old.get("profileName"), "by_pid": by_pid,
+            "by_project": by_project or "?", "by_machine": machine_name()}
+    old_machine = old.get("machine") or machine_name()
+    if old_machine == machine_name():
+        try:
+            write_taken_marker(info)
+        except (ValueError, OSError) as e:
+            print(f"WARNING: could not leave a takeover note for the old holder: {e}", file=sys.stderr)
+        return
+    tell_remote_holder(old_machine, info)
+
+
+def taken_over_note():
+    """Say once that this session's turn was taken. The marker is leases/taken/<old pid>.json."""
+    marker = os.path.join(lease_dir(), "taken", f"{session_pid()}.json")
+    info = read_lease(marker)
+    if not info:
+        return None
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
+    return (f"CHROME LEASE TAKEN OVER: your claim on {info.get('profileName')} was taken by pid "
+            f"{info.get('by_pid')}, project {info.get('by_project')}, on {info.get('by_machine') or 'this machine'} "
+            f"(idle over {stale_minutes()} min, or forced). Do not drive Chrome now. Claim again with "
+            f"`chrome-lanes claim <name> --wait 600`, or stop and ask the user.")
+
+
+def cmd_guard(argv):
+    """Record activity on this session's leases. Exit 2 only to deliver a takeover note."""
+    try:
+        hook = json.load(sys.stdin)
+        if not isinstance(hook, dict):
+            hook = {}
+    except ValueError:
+        hook = {}
+    tool = (hook.get("tool_name") or "").split("__")[-1]
+    if tool in GUARD_PASS:
+        return 0
+    taken = taken_over_note()
+    if taken:
+        print(taken, file=sys.stderr)
+        return 2
+    pid, now = session_pid(), datetime.now(timezone.utc)
+    for _path, lease in lease_files():
+        if not is_mine(lease, pid):
+            continue
+        lease["last_used"] = now.isoformat()
+        write_lease(lease)
+        refresh_remote_lease(lease, now)
+    return 0
+
+
+# ---------- snippet ----------
+
+def cmd_snippet(argv):
+    me = shlex.quote(os.path.realpath(__file__))
+    fragment = {
+        "permissions": {"deny": [f"{CHROME_TOOLS}switch_browser"]},
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": f"{me} snapshot || true"}]}],
+            "PreToolUse": [{"matcher": f"{CHROME_TOOLS}.*",
+                            "hooks": [{"type": "command", "command": f"{me} guard", "timeout": 15}]}],
+        },
+    }
+    notes = [
+        "Merge this into ~/.claude/settings.json (or a project's .claude/settings.json). Nothing was written.",
+        "permissions.deny switch_browser: that tool asks every connected Chrome window to reconnect,",
+        "  which moves the selected browser under every other running session. Use select_browser <id>.",
+        "hooks.SessionStart snapshot: refreshes the snapshot when a session starts, so lookup --cached",
+        "  is current. `|| true` keeps a Chrome problem from blocking the session start.",
+        "hooks.PreToolUse guard: runs before each Claude in Chrome tool call and stamps this session's",
+        "  lease. It blocks one call (exit 2) only to say that another session took the turn.",
+    ]
+    print("\n".join(notes), file=sys.stderr)
+    print(json.dumps(fragment, indent=2))
+    return 0
+
+
+# ---------- optional: several machines (does nothing unless CHROME_LANES_HOSTS is set) ----------
+
+REMOTE_REFRESH_MINUTES = 5      # how often an active holder re-stamps its remote lease copy
+
+
+def hosts_map():
+    """{machine name: ssh host} from CHROME_LANES_HOSTS="name=host,name=host". Empty when unset."""
+    out = {}
+    for pair in os.environ.get("CHROME_LANES_HOSTS", "").split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        name, sep, host = (s.strip() for s in pair.partition("="))
+        if not sep or not name or not host or host.startswith("-"):
+            note_once(f"CHROME_LANES_HOSTS entry {pair!r} is not name=ssh-host, ignored")
+            continue
+        out[name] = host
+    return out
+
+
+def remote_call(name, args):
+    """Run this script's own source on machine `name` via `ssh HOST python3 - ARGS`. Returns
+    (rc, text): stdout on success, stdout+stderr on failure. Never raises."""
+    host = hosts_map().get(name)
+    if not host:
+        return 1, f"no ssh host for {name!r} in CHROME_LANES_HOSTS"
+    try:
+        with open(__file__) as f:
+            src = f.read()
+    except OSError as e:
+        return 1, str(e)
+    # ssh hands the remote shell one string, so every argument is shell-quoted.
+    remote = (f"CHROME_LANES_MACHINE={shlex.quote(name)} python3 - "
+              + " ".join(shlex.quote(a) for a in args))
+    try:
+        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6", host, remote],
+                              input=src, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    if proc.returncode == 0:
+        return 0, proc.stdout.strip()
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def place_remote_lease(row, lease):
+    """Copy the lease to the machine that owns the profile. Warns, never fails the claim."""
+    owner = row.get("machine")
+    if not owner or owner == machine_name():
+        return
+    if owner not in hosts_map():
+        print(f"WARNING: {row.get('profileName')} is listed under machine {owner!r}, which has no "
+              f"entry in CHROME_LANES_HOSTS. No lease copy placed there. Run `chrome-lanes snapshot`, "
+              f"and tell the user the profile is in use.", file=sys.stderr)
+        return
+    rc, out = remote_call(owner, ["lease-put", json.dumps(lease)])
+    if rc != 0:
+        print(f"WARNING: lease copy on {owner} not written: {out}. Tell the user that "
+              f"{row.get('profileName')} is in use.", file=sys.stderr)
+        return
+    lease["remote_machine"] = owner
+    write_lease(lease)
+    print(f"remote lease placed on {owner}")
+
+
+def _remote_or_warn(machine, args, what):
+    rc, out = remote_call(machine, args)
+    if rc != 0:
+        print(f"WARNING: {what} on {machine} failed: {out}. Tell the user.", file=sys.stderr)
+
+
+def delete_remote_lease(lease):
+    if lease.get("remote_machine"):
+        _remote_or_warn(lease["remote_machine"], ["lease-del", lease.get("deviceId") or ""],
+                        "removing the lease copy")
+
+
+def tell_remote_holder(machine, info):
+    _remote_or_warn(machine, ["lease-taken", json.dumps(info)], "telling the old holder")
+
+
+def refresh_remote_lease(lease, now):
+    owner = lease.get("remote_machine")
+    if not owner:
+        return
+    try:
+        last = datetime.fromisoformat(lease.get("remote_refreshed") or lease["since"])
+    except (TypeError, ValueError, KeyError):
+        last = now - timedelta(days=1)
+    if now - last < timedelta(minutes=REMOTE_REFRESH_MINUTES):
+        return
+    rc, out = remote_call(owner, ["lease-put", json.dumps(lease)])
+    if rc == 0:
+        lease["remote_refreshed"] = now.isoformat()
+        write_lease(lease)
+    else:
+        print(f"note: lease copy on {owner} not refreshed: {out}", file=sys.stderr)
+
+
+def fetch_peers():
+    """snapshot --peers: store each other machine's live profile list under peers/<name>.json."""
+    hosts = hosts_map()
+    if not hosts:
+        print("snapshot --peers: CHROME_LANES_HOSTS is not set", file=sys.stderr)
+        return 2
+    rc_all = 0
+    for name in sorted(hosts):
+        if name == machine_name():
+            continue
+        rc, out = remote_call(name, ["list", "--json"])
+        try:
+            rows = json.loads(out) if rc == 0 else None
+            if not isinstance(rows, list):
+                raise ValueError
+        except ValueError:
+            print(f"WARNING: no profile list from {name} (exit {rc}): {out[:300]}", file=sys.stderr)
+            rc_all = 1
+            continue
+        _atomic_json(os.path.join(peers_dir(), f"{name}.json"),
+                     {"machine": name, "written": now_iso(), "browsers": [dict(r, machine=name) for r in rows]})
+        print(f"peers: {len(rows)} profiles from {name}")
+    return rc_all
+
+
+def peer_rows(seen):
+    """Rows from peers/*.json, skipping ids already seen. Empty when CHROME_LANES_HOSTS is unset."""
+    d = peers_dir()
+    if not hosts_map() or not os.path.isdir(d):
+        return []
+    out = []
+    for fname in sorted(os.listdir(d)):
+        if not fname.endswith(".json") or fname.startswith(".") or fname[:-5] == machine_name():
+            continue
+        try:
+            with open(os.path.join(d, fname)) as f:
+                data = json.load(f)
+            browsers = data["browsers"]
+        except (OSError, ValueError, KeyError, TypeError):
+            note_once(f"unreadable peer snapshot {fname}, skipped")
+            continue
+        for r in browsers:
+            did = r.get("deviceId")
+            if did and did in seen:
+                continue
+            out.append(dict(r, machine=r.get("machine") or data.get("machine")))
+            if did:
+                seen.add(did)
+    return out
+
+
+def _plumbing(cmd, argv):
+    """lease-put JSON | lease-del ID | lease-taken JSON: the far end of a remote call."""
+    if not argv:
+        print(f"{cmd}: argument required", file=sys.stderr)
+        return 2
+    try:
+        if cmd == "lease-del":
+            path = lease_path(argv[0])
+            if os.path.exists(path):
+                os.remove(path)
+                print(f"lease-del: {argv[0]}")
+            else:
+                print("lease-del: none")
+            return 0
+        data = json.loads(argv[0])
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        if cmd == "lease-put":
+            write_lease(data)
+            print(f"lease-put: {data.get('profileName')}")
+        else:
+            write_taken_marker(data)
+            print(f"lease-taken: pid {data.get('pid')}")
+        return 0
+    except ValueError as e:
+        print(f"{cmd}: {e}", file=sys.stderr)
+        return 2
+
+
+# ---------- CLI ----------
+
+def cmd_list(argv, lookup=None):
+    cached = "--cached" in argv
+    argv = [a for a in argv if a != "--cached"]
+    try:
+        rows = load_rows(cached)
+    except NoSnapshot:
+        print(f"no snapshot at {snapshot_path()}. Run: chrome-lanes snapshot", file=sys.stderr)
+        return 3
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"cannot read Chrome's profile list under {profile_root()} ({e})", file=sys.stderr)
+        return 1
+    if lookup is not None:
+        hits = find_by_name(rows, lookup)
+        for r in hits:
+            print(r.get("deviceId") or no_id_text(r), r.get("machine") or "-", r.get("profileDir"),
+                  r.get("profileName"), r.get("account") or "-", r.get("label") or "")
+        if not hits:
+            print(f"NO PROFILE matches {lookup!r}", file=sys.stderr)
+        return 0 if hits else 2
+    ids = [a for a in argv if UUID.fullmatch(a)]
+    missing = set()
+    if ids:
+        rows = [r for r in rows if r.get("deviceId") in ids]
+        missing = set(ids) - {r.get("deviceId") for r in rows}
+    if "--json" in argv:
+        print(json.dumps(rows, indent=1))
+    else:
+        w = max([len(r.get("profileName") or "") for r in rows] + [7])
+        print(f"{'device id':36}  {'machine':10}  {'dir':10}  {'profile':{w}}  {'account':28}  label")
+        for r in rows:
+            print(f"{r.get('deviceId') or no_id_text(r):36}  {r.get('machine') or '-':10}  "
+                  f"{r.get('profileDir') or '':10}  {r.get('profileName') or '':{w}}  "
+                  f"{r.get('account') or '':28}  {r.get('label') or ''}")
+    for m in sorted(missing):
+        print(f"NOT FOUND in any profile's extension storage: {m}", file=sys.stderr)
+    return 2 if missing else 0
+
+
+def cmd_snapshot(argv):
+    try:
+        rows = scan()
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        print(f"snapshot: cannot read Chrome's profile list under {profile_root()} ({e}). "
+              f"Nothing written.", file=sys.stderr)
+        return 1
+    write_snapshot(rows)
+    print(f"snapshot: {len(rows)} profiles -> {snapshot_path()}")
+    return fetch_peers() if "--peers" in argv else 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help") or (len(argv) > 1 and argv[1] in ("-h", "--help")):
+        print(__doc__)
+        return 0 if argv else 2
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "list":
+        return cmd_list(rest)
+    if cmd == "lookup":
+        names = [a for a in rest if a != "--cached"]
+        if not names:
+            print("lookup: NAME required", file=sys.stderr)
+            return 2
+        return cmd_list(["--cached"] if "--cached" in rest else [], lookup=names[0])
+    handlers = {"snapshot": cmd_snapshot, "claim": cmd_claim, "release": cmd_release,
+                "status": cmd_status, "guard": cmd_guard, "open": cmd_open, "snippet": cmd_snippet}
+    if cmd in handlers:
+        return handlers[cmd](rest)
+    if cmd in ("lease-put", "lease-del", "lease-taken"):
+        return _plumbing(cmd, rest)
+    print(f"unknown command {cmd!r}. Run: chrome-lanes --help", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""pull-gate: see what is incoming before it runs, and fast-forward only what you allowed.
+
+Pulled code executes. Hooks, scripts and agent settings all run on the machine that
+pulled them. When several machines or agents push to the same repos, a session should
+know what is incoming before it starts. pull-gate fetches (read-only), classifies every
+incoming path, prints a banner, and runs `git merge --ff-only` on its own only when
+every incoming path is covered by a safe list you wrote, in a repo you named.
+
+Each incoming path gets one class:
+  exec          matches an exec pattern. Never auto-merged, even under a safe prefix.
+  safe          sits under a safe prefix and matches no exec pattern.
+  unclassified  matches neither. Nothing says whether it executes, so there is no verdict.
+  suspicious    absolute, contains "..", or contains control characters. Refused.
+
+The whole batch gets one verdict, because a fast-forward is all or nothing:
+  AUTO-FF       every path is safe and the repo is listed in safe_repos.
+  MANUAL        a person decides (exec, suspicious, repo not listed, nothing incoming).
+  NO-VERDICT    at least one path is unclassified.
+
+With an empty config every list is empty, so nothing is classified and nothing merges.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
+
+AUTO_FF = "AUTO-FF"
+MANUAL = "MANUAL"
+NO_VERDICT = "NO-VERDICT"
+
+EXIT_FOR_VERDICT = {AUTO_FF: 0, MANUAL: 1, NO_VERDICT: 2}
+EXIT_CONFIG = 3
+EXIT_USAGE = 64
+
+CONFIG_KEYS = ("safe_prefixes", "safe_repos", "exec_patterns")
+MAX_LISTED = 25
+
+HELP_EPILOG = """\
+config file:
+  $PULL_GATE_CONFIG, or ~/.config/pull-gate/config.json when that is unset.
+  A JSON object. Keys that start with an underscore are ignored (use them as comments).
+  Every key defaults to an empty list, and with empty lists nothing auto-merges.
+    safe_prefixes  Path prefixes that may be fast-forwarded without a person. Each must
+                   end with "/", so "status/" cannot match "status_notes/".
+    safe_repos     Repo directory names where auto-fast-forward is allowed at all.
+                   Matched against the last part of the repo path.
+    exec_patterns  Regular expressions, case-insensitive, matched anywhere in a path.
+                   A match means "this executes". It wins over a safe prefix.
+  A missing file means an empty policy. An unreadable or invalid file is reported loudly
+  and also means an empty policy.
+
+environment (check):
+  PULL_GATE_ROOT           directory whose git repos are swept (default: parent of cwd)
+  PULL_GATE_THROTTLE       seconds. Skip the fetch if the last one is newer (default 900)
+  PULL_GATE_FETCH_TIMEOUT  seconds allowed per fetch (default 20)
+  PULL_GATE_BUDGET         seconds allowed for all fetches together (default 60)
+
+exit codes:
+  decide: 0 AUTO-FF, 1 MANUAL, 2 NO-VERDICT, 3 config unusable, 64 usage error
+  check:  0 every repo reached a verdict, 1 the check itself failed on some repo
+"""
+
+
+class ConfigError(Exception):
+    """The policy is malformed. Raised before any decision is made with it."""
+
+
+class CannotDecide(Exception):
+    """A repo could not be examined. The sweep reports it, it never skips it quietly."""
+
+
+# ---------------------------------------------------------------------------
+# Policy
+# ---------------------------------------------------------------------------
+
+def _str_list(key: str, value: object) -> Tuple[str, ...]:
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
+        raise ConfigError("%s must be a list of strings" % key)
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ConfigError("%s must hold non-empty strings, got %r" % (key, item))
+    return tuple(value)
+
+
+class Policy:
+    """A validated policy. The default is empty: nothing classified, nothing merged."""
+
+    def __init__(self, safe_prefixes: Sequence[str] = (), safe_repos: Sequence[str] = (),
+                 exec_patterns: Sequence[str] = ()) -> None:
+        self.safe_prefixes = _str_list("safe_prefixes", safe_prefixes)
+        self.safe_repos = _str_list("safe_repos", safe_repos)
+        self.exec_patterns = _str_list("exec_patterns", exec_patterns)
+        for prefix in self.safe_prefixes:
+            if not prefix.endswith("/"):
+                raise ConfigError("safe_prefixes entry %r must end with '/'" % prefix)
+            if prefix.startswith("/") or ".." in prefix.split("/"):
+                raise ConfigError("safe_prefixes entry %r must be relative, without '..'" % prefix)
+        for repo in self.safe_repos:
+            if "/" in repo:
+                raise ConfigError("safe_repos entry %r must be a directory name, not a path" % repo)
+        self._exec_res: List["re.Pattern[str]"] = []
+        for pattern in self.exec_patterns:
+            try:
+                self._exec_res.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as exc:
+                raise ConfigError("exec_patterns entry %r is not a valid regex (%s)" % (pattern, exc))
+
+    def is_exec(self, path: str) -> bool:
+        return any(rx.search(path) for rx in self._exec_res)
+
+    def is_safe(self, path: str) -> bool:
+        return any(path.startswith(prefix) for prefix in self.safe_prefixes)
+
+
+class Loaded(NamedTuple):
+    policy: Policy
+    state: str      # "ok", "missing" or "invalid"
+    path: str
+    problem: str
+
+
+def config_path() -> str:
+    explicit = os.environ.get("PULL_GATE_CONFIG")
+    if explicit:
+        return explicit
+    return os.path.join(os.path.expanduser("~"), ".config", "pull-gate", "config.json")
+
+
+def load_policy(path: str) -> Loaded:
+    """Read the config. Anything unusable yields an empty policy plus a stated problem."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return Loaded(Policy(), "missing", path, "")
+    except OSError as exc:
+        return Loaded(Policy(), "invalid", path, "cannot read it (%s)" % exc)
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return Loaded(Policy(), "invalid", path, "not valid JSON (%s)" % exc)
+    if not isinstance(data, dict):
+        return Loaded(Policy(), "invalid", path, "the top level must be a JSON object")
+    unknown = sorted(k for k in data if not k.startswith("_") and k not in CONFIG_KEYS)
+    if unknown:
+        return Loaded(Policy(), "invalid", path,
+                      "unknown key(s) %s, expected %s" % (", ".join(unknown), ", ".join(CONFIG_KEYS)))
+    try:
+        policy = Policy(**{k: data[k] for k in CONFIG_KEYS if k in data})
+    except ConfigError as exc:
+        return Loaded(Policy(), "invalid", path, str(exc))
+    return Loaded(policy, "ok", path, "")
+
+
+# ---------------------------------------------------------------------------
+# Decision (pure: no git, no disk)
+# ---------------------------------------------------------------------------
+
+class Decision(NamedTuple):
+    verdict: str
+    reason: str
+    cause: str                       # ok, empty, suspicious, exec, unclassified, repo
+    classes: Dict[str, List[str]]
+
+
+def _suspicious(path: str) -> bool:
+    if not path.strip() or path.startswith("/") or ".." in path.split("/"):
+        return True
+    return any(ord(ch) < 32 or ord(ch) == 127 for ch in path)
+
+
+def classify(path: str, policy: Policy) -> str:
+    if _suspicious(path):
+        return "suspicious"
+    if policy.is_exec(path):
+        return "exec"
+    if policy.is_safe(path):
+        return "safe"
+    return "unclassified"
+
+
+def _show(path: str) -> str:
+    """Printable form of a path. Control characters are escaped so they cannot forge lines."""
+    return path if path.isprintable() else repr(path)
+
+
+def _first(classes: Dict[str, List[str]], key: str, suffix: str) -> str:
+    items = classes[key]
+    more = " (and %d more)" % (len(items) - 1) if len(items) > 1 else ""
+    return "%s%s %s" % (_show(items[0]), more, suffix)
+
+
+def decide(paths: Sequence[str], repo: str, policy: Policy) -> Decision:
+    """May these incoming paths be fast-forwarded without a person?"""
+    clean = [p for p in paths if p]
+    classes: Dict[str, List[str]] = {"suspicious": [], "exec": [], "safe": [], "unclassified": []}
+    if not clean:
+        return Decision(MANUAL, "nothing incoming", "empty", classes)
+    for path in clean:
+        classes[classify(path, policy)].append(path)
+    if classes["suspicious"]:
+        return Decision(MANUAL, _first(classes, "suspicious", "is a suspicious path, refused"),
+                        "suspicious", classes)
+    if classes["exec"]:
+        return Decision(MANUAL, _first(classes, "exec", "matches an exec pattern, needs a person"),
+                        "exec", classes)
+    if classes["unclassified"]:
+        return Decision(NO_VERDICT,
+                        _first(classes, "unclassified",
+                               "matches no exec pattern and no safe prefix, so nothing says "
+                               "whether it executes"),
+                        "unclassified", classes)
+    if repo not in policy.safe_repos:
+        listed = ", ".join(policy.safe_repos) if policy.safe_repos else "none"
+        return Decision(MANUAL, "repo '%s' is not in safe_repos (listed: %s)" % (repo, listed),
+                        "repo", classes)
+    return Decision(AUTO_FF, "%d file(s), all under safe prefixes" % len(clean), "ok", classes)
+
+
+# ---------------------------------------------------------------------------
+# git plumbing
+# ---------------------------------------------------------------------------
+
+def _git_env() -> Dict[str, str]:
+    drop = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR")
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["LC_ALL"] = "C"
+    env.setdefault("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+    env.setdefault("GIT_HTTP_LOW_SPEED_TIME", "6")
+    return env
+
+
+def _git(repo: str, *args: str, timeout: Optional[float] = None,
+         detach: bool = False) -> Tuple[int, str, str]:
+    """Run git in repo. Returns (exit code, stdout, stderr). Never raises on a git failure."""
+    try:
+        proc = subprocess.Popen(["git", "-C", repo] + list(args), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=_git_env(), start_new_session=detach)
+    except OSError as exc:
+        raise CannotDecide("cannot run git (%s)" % exc)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if detach:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except OSError:
+            pass
+        proc.communicate()
+        return 124, "", "timed out after %ds" % int(timeout or 0)
+    return (proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace"))
+
+
+def _why(out: str, err: str, rc: int) -> str:
+    lines = (err or out).strip().splitlines()
+    return lines[0][:80] if lines else "exit %d" % rc
+
+
+def repo_name(repo: str) -> str:
+    return os.path.basename(os.path.realpath(repo))
+
+
+def repo_is_mid_operation(repo: str) -> Optional[bool]:
+    """True: a rebase, merge or cherry-pick is in progress. False: checked, none is.
+    None: git could not say. The caller must treat None as "do not touch", never as False."""
+    try:
+        rc, out, _ = _git(repo, "rev-parse", "--git-dir")
+    except CannotDecide:
+        return None
+    if rc != 0:
+        return None
+    gitdir = os.path.join(repo, out.strip())
+    return any(os.path.exists(os.path.join(gitdir, name))
+               for name in ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD"))
+
+
+def _count(repo: str, spec: str) -> int:
+    rc, out, err = _git(repo, "rev-list", "--count", spec)
+    if rc != 0:
+        raise CannotDecide("rev-list %s failed (%s)" % (spec, _why(out, err, rc)))
+    try:
+        return int(out.strip())
+    except ValueError:
+        raise CannotDecide("unreadable commit count %r" % out.strip()[:20])
+
+
+# ---------------------------------------------------------------------------
+# The sweep
+# ---------------------------------------------------------------------------
+
+class Context(NamedTuple):
+    policy: Policy
+    merge: bool
+    throttle: float
+    fetch_timeout: float
+    deadline: float        # time.monotonic() value after which no more fetches start
+
+
+class Result(NamedTuple):
+    kind: str              # "current", "no_upstream" or "finding"
+    name: str
+    lines: List[str]
+    detail: str = ""
+
+
+def _recently_fetched(repo: str, throttle: float) -> bool:
+    if throttle <= 0:
+        return False
+    rc, out, _ = _git(repo, "rev-parse", "--git-path", "FETCH_HEAD")
+    if rc != 0:
+        return False
+    try:
+        age = time.time() - os.stat(os.path.join(repo, out.strip())).st_mtime
+    except OSError:
+        return False
+    return age < throttle
+
+
+def _maybe_fetch(repo: str, branch: str, ctx: Context) -> str:
+    """Fetch unless throttled. Returns a problem description, or "" when the state is fresh."""
+    if _recently_fetched(repo, ctx.throttle):
+        return ""
+    remaining = ctx.deadline - time.monotonic()
+    if remaining <= 0:
+        return "fetch skipped, the time budget is used up"
+    rc, out, err = _git(repo, "fetch", "--quiet", "--no-tags", "origin", branch,
+                        timeout=min(ctx.fetch_timeout, remaining), detach=True)
+    return "" if rc == 0 else "fetch failed (%s)" % _why(out, err, rc)
+
+
+def _listing(title: str, items: List[str]) -> List[str]:
+    lines = ["  " + title]
+    lines.extend("    " + _show(p) for p in items[:MAX_LISTED])
+    if len(items) > MAX_LISTED:
+        lines.append("    ... and %d more" % (len(items) - MAX_LISTED))
+    return lines
+
+
+def examine(repo: str, ctx: Context) -> Result:
+    """Fetch, compare and classify one repo. Raises CannotDecide when it cannot tell."""
+    name = repo_name(repo)
+    rc, out, err = _git(repo, "symbolic-ref", "--short", "-q", "HEAD")
+    if rc == 1:
+        return Result("finding", name, ["%s: detached HEAD, not compared with origin." % name])
+    if rc != 0:
+        raise CannotDecide("cannot read the branch (%s)" % _why(out, err, rc))
+    branch = out.strip()
+    rc, out, err = _git(repo, "config", "--get", "remote.origin.url")
+    if rc == 1:
+        return Result("no_upstream", name, [], "no origin remote")
+    if rc != 0:
+        raise CannotDecide("cannot read the origin remote (%s)" % _why(out, err, rc))
+
+    ref, shown = "refs/remotes/origin/" + branch, "origin/" + branch
+    problem = _maybe_fetch(repo, branch, ctx)
+    stale = ("%s: %s, comparing with the last fetched state, which may be stale." % (name, problem)
+             if problem else "")
+    rc, out, err = _git(repo, "rev-parse", "--verify", "--quiet", ref)
+    if rc == 1:
+        if problem:
+            return Result("finding", name, ["%s: no %s to compare with, and %s." % (name, shown, problem)])
+        return Result("no_upstream", name, [], "no " + shown)
+    if rc != 0:
+        raise CannotDecide("cannot read %s (%s)" % (shown, _why(out, err, rc)))
+
+    behind = _count(repo, "HEAD..%s" % ref)
+    ahead = _count(repo, "%s..HEAD" % ref)
+    notes = [stale] if stale else []
+    if behind == 0:
+        # Up to date, or only ahead. Unpushed work is not an incoming change.
+        return Result("finding" if notes else "current", name, notes)
+
+    rc, out, err = _git(repo, "diff", "--name-only", "-z", "--no-renames", "HEAD...%s" % ref)
+    if rc != 0:
+        raise CannotDecide("cannot list incoming files (%s)" % _why(out, err, rc))
+    paths = [p for p in out.split("\0") if p]
+    verdict = decide(paths, name, ctx.policy)
+
+    lines = list(notes)
+    refused = ""
+    if ahead == 0 and verdict.verdict == AUTO_FF:
+        if not ctx.merge:
+            refused = "would fast-forward, but check was run with --no-merge"
+        else:
+            mid = repo_is_mid_operation(repo)
+            if mid is None:
+                refused = ("could not determine: repo state (git could not say whether a rebase "
+                           "or merge is in progress)")
+            elif mid:
+                refused = "repo is mid-rebase or mid-merge, a person must finish that first"
+            else:
+                rc, out, err = _git(repo, "merge", "--ff-only", ref)
+                if rc == 0:
+                    lines.append("%s: AUTO-FAST-FORWARDED, %s, no exec pattern matched."
+                                 % (name, verdict.reason))
+                    return Result("finding", name, lines)
+                refused = "git refused the fast-forward (%s)" % _why(out, err, rc)
+
+    classes = verdict.classes
+    counts = "%d executable, %d safe-listed, %d unclassified" % (
+        len(classes["exec"]), len(classes["safe"]), len(classes["unclassified"]))
+    if classes["suspicious"]:
+        counts += ", %d refused" % len(classes["suspicious"])
+    if ahead > 0:
+        lines.append("%s: DIVERGED, %d local unpushed and %d incoming commit(s), %d file(s) changed: %s. "
+                     "Needs a real merge, not a fast-forward." % (name, ahead, behind, len(paths), counts))
+    else:
+        lines.append("%s: %d incoming commit(s), %d file(s) changed: %s."
+                     % (name, behind, len(paths), counts))
+    if classes["exec"]:
+        lines.extend(_listing("EXECUTABLE, review before merge:", classes["exec"]))
+    if classes["suspicious"]:
+        lines.extend(_listing("REFUSED, suspicious path:", classes["suspicious"]))
+    if classes["unclassified"]:
+        lines.extend(_listing("NO VERDICT, matches no exec pattern and no safe prefix:",
+                              classes["unclassified"]))
+    if refused:
+        lines.append("  not auto-merged: " + refused)
+    elif verdict.cause in ("repo", "empty"):
+        lines.append("  not auto-merged: " + verdict.reason)
+    return Result("finding", name, lines)
+
+
+def find_repos(root: str) -> List[str]:
+    """The root itself if it is a repo, plus every directory directly under it that is one."""
+    root = os.path.realpath(root)
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError as exc:
+        raise CannotDecide("cannot read root %s (%s)" % (root, exc))
+    candidates = [root] + [os.path.join(root, e) for e in entries]
+    repos: List[str] = []
+    for path in candidates:
+        real = os.path.realpath(path)
+        if os.path.isdir(real) and os.path.exists(os.path.join(real, ".git")) and real not in repos:
+            repos.append(real)
+    return repos
+
+
+def run_check(root: str, loaded: Loaded, merge: bool = True, throttle: float = 900.0,
+              fetch_timeout: float = 20.0, budget: float = 60.0) -> Tuple[int, str]:
+    """The session-start sweep. Returns (exit code, text to print). Never returns silence."""
+    try:
+        repos = find_repos(root)
+    except CannotDecide as exc:
+        return 1, "PULL-GATE: THE CHECK ITSELF FAILED: %s.\nThis is not an all-clear." % exc
+    if not repos:
+        return 0, "pull-gate: no git repos found under %s, nothing was checked." % root
+
+    ctx = Context(loaded.policy, merge, throttle, fetch_timeout, time.monotonic() + budget)
+    head: List[str] = []
+    if loaded.state == "missing":
+        head.append("pull-gate: no config at %s. Nothing is classified and nothing auto-merges."
+                    % loaded.path)
+
+    # FAIL-CLOSED ACCOUNTING. SEEN counts repos entered. VERDICTS counts repos that came out
+    # with an explicit Result. If they differ, the check broke somewhere and must say so.
+    seen = verdicts = 0
+    failed: List[Tuple[str, str]] = []
+    findings: List[str] = []
+    current: List[str] = []
+    not_compared: List[str] = []
+    if loaded.state == "invalid":
+        findings.append("pull-gate: config %s is unusable: %s. Using an empty policy, so nothing "
+                        "is classified and nothing auto-merges." % (loaded.path, loaded.problem))
+    for repo in repos:
+        seen += 1
+        name = repo_name(repo)
+        try:
+            result = examine(repo, ctx)
+        except Exception as exc:                      # any failure is a missing verdict
+            failed.append((name, str(exc) if isinstance(exc, CannotDecide)
+                           else "%s: %s" % (type(exc).__name__, exc)))
+            continue
+        if not isinstance(result, Result):
+            failed.append((name, "no verdict was returned"))
+            continue
+        verdicts += 1
+        if result.kind == "current":
+            current.append(name)
+        elif result.kind == "no_upstream":
+            not_compared.append("%s (%s)" % (name, result.detail))
+        findings.extend(result.lines)
+    tail = "Not compared: %s." % ", ".join(not_compared) if not_compared else ""
+
+    out = list(head)
+    if seen != verdicts:
+        names = ", ".join("%s (%s)" % f for f in failed) or "unknown"
+        out.append("PULL-GATE: THE CHECK ITSELF FAILED on %d of %d repo(s): %s."
+                   % (seen - verdicts, seen, names))
+        out.append("This is NOT an all-clear. Audit by hand before starting work:")
+        out.append("  git -C <repo> fetch origin && git -C <repo> rev-list --left-right --count "
+                   "HEAD...origin/<branch>")
+        out.extend(findings)
+        if tail:
+            out.append(tail)
+        return 1, "\n".join(out)
+    if findings:
+        out.append("PULL-GATE: incoming changes, classified. Nothing has been run.")
+        out.extend(findings)
+        if tail:
+            out.append(tail)
+        out.append("Before starting work, read the diff of every executable or unclassified change")
+        out.append("(git -C <repo> log -p HEAD..origin/<branch>). Merge only after a person has read")
+        out.append("it and approved it. Do not run incoming code before that.")
+        return 0, "\n".join(out)
+    if current:
+        line = "pull-gate: ran. %s: nothing incoming as of the last fetch." % ", ".join(current)
+        out.append(line + (" " + tail if tail else ""))
+    else:
+        out.append("pull-gate: ran. Nothing was compared. " + tail)
+    return 0, "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "%s: error: %s\n" % (self.prog, message))
+
+
+def _number(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise ConfigError("%s must be a number of seconds, got %r" % (name, raw))
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = _Parser(prog="pull-gate", formatter_class=argparse.RawDescriptionHelpFormatter,
+                     description="Classify incoming git changes before they run. Fast-forward "
+                                 "automatically only what an explicit safe list covers.",
+                     epilog=HELP_EPILOG)
+    sub = parser.add_subparsers(dest="command", metavar="{decide,check}")
+    p_decide = sub.add_parser(
+        "decide", formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="print the verdict for a list of paths (no git, no network)",
+        description="Print AUTO-FF, MANUAL or NO-VERDICT for the given paths, and exit 0, 1 or 2.\n"
+                    "REPO is a path or a name. Only its last component is compared with safe_repos.\n"
+                    "Put -- before any path that starts with a dash.")
+    p_decide.add_argument("repo")
+    p_decide.add_argument("paths", nargs="+", metavar="path")
+    p_check = sub.add_parser(
+        "check", formatter_class=argparse.RawDescriptionHelpFormatter,
+        help="session-start sweep: fetch, classify and report every repo under a root",
+        description="Sweep every git repo directly under a root (and the root itself if it is\n"
+                    "one). Fetch read-only, classify what is incoming, print a banner, and\n"
+                    "fast-forward only where the policy allows. Prints something every time.\n"
+                    "Root: --root, else $PULL_GATE_ROOT, else the parent of the current directory.")
+    p_check.add_argument("--root", metavar="DIR")
+    p_check.add_argument("--no-merge", action="store_true",
+                         help="report only, never fast-forward (a safe way to try a new config)")
+    return parser
+
+
+def _cmd_decide(args: argparse.Namespace) -> int:
+    loaded = load_policy(config_path())
+    if loaded.state == "invalid":
+        print("ERROR config %s is unusable: %s" % (loaded.path, loaded.problem), file=sys.stderr)
+        return EXIT_CONFIG
+    if loaded.state == "missing":
+        print("pull-gate: no config at %s, so the policy is empty." % loaded.path, file=sys.stderr)
+    result = decide(args.paths, repo_name(args.repo), loaded.policy)
+    print("%s %s" % (result.verdict, result.reason))
+    return EXIT_FOR_VERDICT[result.verdict]
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    try:
+        throttle = _number("PULL_GATE_THROTTLE", 900.0)
+        fetch_timeout = _number("PULL_GATE_FETCH_TIMEOUT", 20.0)
+        budget = _number("PULL_GATE_BUDGET", 60.0)
+    except ConfigError as exc:
+        print("PULL-GATE: THE CHECK ITSELF FAILED: %s.\nThis is not an all-clear." % exc)
+        return 1
+    root = args.root or os.environ.get("PULL_GATE_ROOT") or os.path.dirname(os.getcwd())
+    try:
+        code, text = run_check(root, load_policy(config_path()), merge=not args.no_merge,
+                               throttle=throttle, fetch_timeout=fetch_timeout, budget=budget)
+    except Exception as exc:
+        print("PULL-GATE: THE CHECK ITSELF FAILED: %s: %s.\nThis is not an all-clear."
+              % (type(exc).__name__, exc))
+        return 1
+    print(text)
+    return code
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "decide":
+        return _cmd_decide(args)
+    if args.command == "check":
+        return _cmd_check(args)
+    parser.print_help(sys.stderr)
+    return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,24 @@
+{
+  "_comment": "Copy this file to ~/.config/pull-gate/config.json, or point PULL_GATE_CONFIG at it. Keys that start with an underscore are ignored. As shipped, paths are classified but nothing auto-merges, because both safe lists are empty.",
+
+  "_comment_safe_prefixes": "Path prefixes that may be fast-forwarded without a person. Each must end with a slash. Example: [\"reports/\", \"status/\"]. List only files that are generated and never run. Empty means nothing auto-merges.",
+  "safe_prefixes": [],
+
+  "_comment_safe_repos": "Repo directory names (the last part of the repo path) where auto-fast-forward is allowed at all. Example: [\"alpha\"]. A safe prefix in any other repo never merges on its own. Empty means nothing auto-merges.",
+  "safe_repos": [],
+
+  "_comment_exec_patterns": "Regular expressions, case-insensitive, matched anywhere in the path. A match means the file executes or configures something that executes. It is never auto-merged, even under a safe prefix. These are a starting point, so add your own.",
+  "exec_patterns": [
+    "\\.sh$",
+    "\\.(bash|zsh)$",
+    "\\.py$",
+    "\\.(js|mjs|cjs|ts)$",
+    "\\.(rb|pl|command)$",
+    "(^|/)bin/",
+    "^\\.github/",
+    "settings.*\\.json$",
+    "\\.plist$",
+    "hooks?/",
+    "(^|/)Makefile$"
+  ]
+}

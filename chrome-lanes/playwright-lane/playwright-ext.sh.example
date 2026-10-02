@@ -1,0 +1,40 @@
+#!/bin/bash
+# playwright-ext.sh: start the Playwright MCP server in extension mode.
+#
+# It drives the one Chrome profile where the Playwright extension is installed,
+# paired by the token in TOKEN_FILE. Register this file as a stdio MCP server in
+# your harness. Install a copy with: install -m 700 playwright-ext.sh.example ~/.local/bin/playwright-ext.sh
+set -eu
+
+# Fixed PATH, so a harness's PATH cannot pick a different node or npx.
+# Add your node's bin dir here if npx lives elsewhere (nvm, asdf, volta).
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+export PATH
+
+# The version this template was written against. Bump it on purpose, after a test.
+PLAYWRIGHT_MCP_VERSION=0.0.80
+
+TOKEN_FILE="${PLAYWRIGHT_MCP_TOKEN_FILE:-$HOME/.config/playwright-mcp/token}"
+
+if [ ! -f "$TOKEN_FILE" ]; then
+  echo "playwright-ext: no token file at $TOKEN_FILE" >&2
+  exit 1
+fi
+
+case "$(uname -s)" in
+  Darwin|*BSD) mode=$(stat -f '%Lp' "$TOKEN_FILE") ;;
+  *)           mode=$(stat -c '%a' "$TOKEN_FILE") ;;
+esac
+if [ "$mode" != "600" ]; then
+  echo "playwright-ext: $TOKEN_FILE has mode $mode, expected 600. Run: chmod 600 \"$TOKEN_FILE\"" >&2
+  exit 1
+fi
+
+PLAYWRIGHT_MCP_EXTENSION_TOKEN=$(tr -d '[:space:]' < "$TOKEN_FILE")
+if [ -z "$PLAYWRIGHT_MCP_EXTENSION_TOKEN" ]; then
+  echo "playwright-ext: $TOKEN_FILE is empty" >&2
+  exit 1
+fi
+export PLAYWRIGHT_MCP_EXTENSION_TOKEN
+
+exec npx -y "@playwright/mcp@$PLAYWRIGHT_MCP_VERSION" --extension

@@ -1,0 +1,20 @@
+{
+  "tracker": "file",
+  "note_template": "",
+  "trackers": {
+    "file": {
+      "path": "notes/ledger.md"
+    },
+    "linear": {
+      "team_key": "ENG",
+      "project_name": "",
+      "projects": {
+        "website": "Website"
+      },
+      "issue_id": "",
+      "api_key_env": "LINEAR_API_KEY",
+      "timeout_seconds": 10,
+      "max_items": 50
+    }
+  }
+}

@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""session-usage: tokens and estimated list-price cost for one coding-agent session.
+
+A session transcript records every model call with its token counts, including each
+subagent's. This tool reads the local transcript and prints tokens per model and per
+subagent, plus an estimated cost at API list prices from a dated price table.
+"""
+import argparse
+import glob
+import json
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime
+
+FIELDS = ("calls", "input", "cache_write", "cache_read", "output")
+RESET_DROP = 5.0  # a fall of more than this many points marks a weekly reset
+STALE_PRICE_DAYS = 120
+
+EPILOG = """\
+What it reads (read-only):
+  Claude Code   <projects>/*/<session-id>.jsonl and <session-id>/subagents/*.jsonl
+                <projects> = $CLAUDE_CONFIG_DIR/projects, default ~/.claude/projects
+  Codex         <sessions>/*/*/*/*.jsonl
+                <sessions> = $CODEX_HOME/sessions, default ~/.codex/sessions
+
+Prices:
+  Looked up in this order: --prices PATH, then $SESSION_USAGE_HOME/prices.json,
+  then prices.json next to the bin/ folder. The file has an "as_of" date, which is
+  printed under every table. Models with no price show n/a and are named in the
+  footer. They are left out of the total.
+
+Weekly points (optional):
+  The "~weekly pts" column appears only after --calibrate has written
+  $SESSION_USAGE_HOME/calibration.json. Default home: ~/.config/session-usage.
+  --calibrate needs your own record of weekly usage, passed with --history PATH
+  (or $SESSION_USAGE_HISTORY). PATH is one JSON file or a folder of *.json files:
+
+    {"snapshots": [{"timestamp": 1790000000, "weekly": 42.5,
+                    "buckets": {"<model-name-text>": 12.0}}]}
+
+  timestamp is unix seconds or an ISO-8601 string. weekly is percent of your
+  weekly limit used so far. "buckets" is optional: a separate limit that counts
+  only models whose name contains that text. A weekly reset is a fall of more than
+  5 points between two snapshots.
+
+  --calibrate scans EVERY transcript under the Claude Code projects folder
+  (read-only) and compares each week's peak percentage with that week's list-price
+  value. It writes the pooled points-per-dollar to calibration.json.
+
+Privacy:
+  Output includes subagent task descriptions taken from the transcripts. They are
+  your own data. Check them before pasting a table anywhere.
+
+Exit codes: 0 done, 2 could not decide (missing transcript, bad file, no data).
+"""
+
+
+class UsageError(Exception):
+    pass
+
+
+def warn(msg):
+    print("session-usage: " + msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------- locations
+
+def tool_home():
+    return os.environ.get("SESSION_USAGE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config", "session-usage")
+
+
+def claude_projects_dir():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+    return os.path.join(base, "projects")
+
+
+def codex_sessions_dir():
+    base = os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
+    return os.path.join(base, "sessions")
+
+
+def bundled_prices_path():
+    here = os.path.dirname(os.path.realpath(__file__))
+    return os.path.join(os.path.dirname(here), "prices.json")
+
+
+# ---------------------------------------------------------------- prices
+
+def load_prices(path):
+    """Read a price table. Raises UsageError when it cannot be trusted."""
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except OSError as e:
+        raise UsageError(f"cannot read prices file {path}: {e.strerror}")
+    except ValueError as e:
+        raise UsageError(f"prices file {path} is not valid JSON: {e}")
+    if not isinstance(data, dict) or not isinstance(data.get("models"), list) or not data["models"]:
+        raise UsageError(f"prices file {path} needs a non-empty \"models\" list")
+    as_of = data.get("as_of")
+    try:
+        datetime.strptime(as_of, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        raise UsageError(f"prices file {path} needs an \"as_of\" date written YYYY-MM-DD")
+    models = []
+    for i, m in enumerate(data["models"]):
+        try:
+            models.append((str(m["match"]), float(m["input"]), float(m["output"]),
+                           float(m["cache_read"])))
+        except (KeyError, TypeError, ValueError):
+            raise UsageError(f"prices file {path}: models[{i}] needs match, input, output, cache_read")
+    try:
+        mult = float(data.get("cache_write_multiplier", 2))
+    except (TypeError, ValueError):
+        raise UsageError(f"prices file {path}: cache_write_multiplier must be a number")
+    return {"as_of": as_of, "models": models, "cache_write_multiplier": mult, "path": path}
+
+
+def resolve_prices(explicit):
+    """Return a price table, or None with a warning. An explicit --prices must load."""
+    if explicit:
+        return load_prices(explicit)
+    for path in (os.path.join(tool_home(), "prices.json"), bundled_prices_path()):
+        if os.path.exists(path):
+            try:
+                return load_prices(path)
+            except UsageError as e:
+                warn(f"{e}. Costs are not shown.")
+                return None
+    warn("no prices.json found. Costs are not shown.")
+    return None
+
+
+def usd(model, u, prices):
+    """List-price dollar value of one usage bucket. None when the model has no price."""
+    if not prices:
+        return None
+    name = model or ""
+    for key, i, o, cr in prices["models"]:
+        if key in name:
+            return (u["input"] * i + u["cache_write"] * i * prices["cache_write_multiplier"]
+                    + u["cache_read"] * cr + u["output"] * o) / 1e6
+    return None
+
+
+# ---------------------------------------------------------------- calibration file
+
+def calibration_path():
+    return os.path.join(tool_home(), "calibration.json")
+
+
+def load_calibration():
+    """Return fitted points-per-dollar values, or None when there is no usable file."""
+    path = calibration_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        cal = {"fitted": str(data.get("fitted", "?")), "weekly": float(data["weekly"]),
+               "buckets": {str(k): float(v) for k, v in (data.get("buckets") or {}).items()}}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        warn(f"{path} is unusable ({type(e).__name__}). The weekly points column is left out.")
+        return None
+    return cal
+
+
+# ---------------------------------------------------------------- transcripts
+
+def _blank():
+    return dict.fromkeys(FIELDS, 0)
+
+
+def slug_for(cwd):
+    # Claude Code names a project folder after the working directory:
+    # every character that is not a letter or digit becomes "-".
+    return "".join(c if c.isalnum() else "-" for c in cwd)
+
+
+def read_claude_transcript(path, stats=None):
+    """Sum usage per model from one transcript. Returns (per_model, first_ts, last_ts).
+
+    One API response is written as several `assistant` lines (one per content block),
+    each carrying the same usage, so lines are deduplicated by requestId
+    (message.id as the fallback). Unreadable lines are counted in stats["bad_lines"].
+    """
+    per_model = defaultdict(_blank)
+    seen = set()
+    first = last = None
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                if stats is not None:
+                    stats["bad_lines"] = stats.get("bad_lines", 0) + 1
+                continue
+            if not isinstance(d, dict):
+                continue
+            ts = d.get("timestamp")
+            if ts:
+                first = first or ts
+                last = ts
+            if d.get("type") != "assistant":
+                continue
+            msg = d.get("message") or {}
+            usage = msg.get("usage")
+            key = d.get("requestId") or msg.get("id")
+            if not usage or key in seen:
+                continue
+            seen.add(key)
+            m = per_model[msg.get("model") or "unknown"]
+            m["calls"] += 1
+            m["input"] += usage.get("input_tokens", 0) or 0
+            m["cache_write"] += usage.get("cache_creation_input_tokens", 0) or 0
+            m["cache_read"] += usage.get("cache_read_input_tokens", 0) or 0
+            m["output"] += usage.get("output_tokens", 0) or 0
+    return dict(per_model), first, last
+
+
+def claude_report(ref, cwd):
+    """Report for one Claude Code session. ref is a session id, a transcript path, or None."""
+    projects = claude_projects_dir()
+    if ref and os.path.isfile(ref):
+        path = ref
+    else:
+        sid = ref or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        if not sid:
+            raise UsageError("no session id. Pass --session ID or run inside Claude Code, "
+                             "where CLAUDE_CODE_SESSION_ID is set.")
+        hits = glob.glob(os.path.join(projects, "*", sid + ".jsonl"))
+        preferred = os.path.join(projects, slug_for(cwd), sid + ".jsonl")
+        path = preferred if preferred in hits else (hits[0] if hits else None)
+        if not path:
+            raise UsageError(f"no transcript for session {sid} under {projects}")
+    stats = {}
+    main, first, last = read_claude_transcript(path, stats)
+    agents = []
+    subdir = os.path.join(path[: -len(".jsonl")], "subagents")
+    for sub in sorted(glob.glob(os.path.join(subdir, "*.jsonl"))):
+        per_model, _, _ = read_claude_transcript(sub, stats)
+        meta = {}
+        try:
+            with open(sub[: -len(".jsonl")] + ".meta.json") as fh:
+                meta = json.load(fh)
+        except (OSError, ValueError):
+            pass
+        agents.append({"label": str(meta.get("description") or os.path.basename(sub)),
+                       "per_model": per_model})
+    return {"harness": "claude-code", "transcript": path, "first": first, "last": last,
+            "main": main, "agents": agents, "bad_lines": stats.get("bad_lines", 0)}
+
+
+def _codex_head_cwd(line):
+    try:
+        d = json.loads(line)
+        return (d.get("payload") or {}).get("cwd")
+    except (ValueError, AttributeError):
+        return None
+
+
+def codex_report(ref, cwd):
+    """Report for one Codex rollout. ref is a path, or None for the newest one for cwd."""
+    path = ref
+    if not path:
+        cands = sorted(glob.glob(os.path.join(codex_sessions_dir(), "*", "*", "*", "*.jsonl")),
+                       key=os.path.getmtime, reverse=True)
+        want = {cwd, os.path.realpath(cwd)}
+        for c in cands:
+            with open(c, errors="replace") as fh:
+                head = _codex_head_cwd(fh.readline())
+            if head and (head in want or os.path.realpath(head) in want):
+                path = c
+                break
+        if not path:
+            raise UsageError(f"no Codex rollout found for {cwd} under {codex_sessions_dir()}")
+    model, total, first, last, bad = "unknown", None, None, None, 0
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                bad += 1
+                continue
+            if not isinstance(d, dict):
+                continue
+            ts = d.get("timestamp")
+            if ts:
+                first = first or ts
+                last = ts
+            p = d.get("payload") or {}
+            if p.get("model"):
+                model = p["model"]
+            if p.get("type") == "token_count" and (p.get("info") or {}).get("total_token_usage"):
+                total = p["info"]["total_token_usage"]  # cumulative: the last one wins
+    m = _blank()
+    if total:
+        cached = total.get("cached_input_tokens", 0) or 0
+        m["input"] = (total.get("input_tokens", 0) or 0) - cached  # Codex counts cached inside input
+        m["cache_read"] = cached
+        m["cache_write"] = total.get("cache_write_input_tokens", 0) or 0
+        m["output"] = total.get("output_tokens", 0) or 0
+    return {"harness": "codex", "transcript": path, "first": first, "last": last,
+            "main": {model: m} if total else {}, "agents": [], "bad_lines": bad}
+
+
+# ---------------------------------------------------------------- summary and output
+
+def summarize(rep, prices, calib):
+    """Rows with list-price dollars (and weekly points when calibrated), plus totals."""
+    claude = rep["harness"] == "claude-code"
+    use_points = bool(calib and claude)
+    pairs = [("this thread", mdl, u) for mdl, u in rep["main"].items()]
+    for a in rep["agents"]:
+        pairs += [("agent: " + a["label"], mdl, u) for mdl, u in a["per_model"].items()]
+    rows, unpriced = [], set()
+    tot = _blank()
+    tot_usd, tot_pts, tot_bucket = None, 0.0, defaultdict(float)
+    for who, mdl, u in pairs:
+        v = usd(mdl, u, prices)
+        pts, bucket_pts = None, {}
+        if v is None:
+            unpriced.add(mdl)
+        else:
+            tot_usd = (tot_usd or 0.0) + v
+            if use_points:
+                pts = v * calib["weekly"]
+                tot_pts += pts
+                for name, rate in calib["buckets"].items():
+                    if name in mdl:
+                        bucket_pts[name] = v * rate
+                        tot_bucket[name] += v * rate
+        row = {"who": who, "model": mdl, **u, "usd": v, "weekly_points": pts}
+        if bucket_pts:
+            row["bucket_points"] = bucket_pts
+        rows.append(row)
+        for f in FIELDS:
+            tot[f] += u[f]
+    total = {**tot, "usd": tot_usd}
+    if use_points:
+        total["weekly_points"] = tot_pts
+        total["bucket_points"] = dict(tot_bucket)
+    return {"rows": rows, "total": total, "unpriced_models": sorted(unpriced),
+            "prices_as_of": prices["as_of"] if prices else None,
+            "calibration": calib if use_points else None}
+
+
+def _k(n):
+    return f"{n / 1e6:.1f}M" if n >= 1e6 else f"{n / 1e3:.0f}k" if n >= 1e3 else str(n)
+
+
+def _span(first, last):
+    try:
+        a = datetime.fromisoformat(first.replace("Z", "+00:00"))
+        b = datetime.fromisoformat(last.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return "?"
+    mins = int((b - a).total_seconds() // 60)
+    return f"{mins // 60} h {mins % 60:02d} min" if mins >= 60 else f"{mins} min"
+
+
+def _days_old(as_of):
+    try:
+        return (datetime.now() - datetime.strptime(as_of, "%Y-%m-%d")).days
+    except (TypeError, ValueError):
+        return None
+
+
+def render(rep, prices=None, calib=None):
+    s = summarize(rep, prices, calib)
+    pts_col = s["calibration"] is not None
+    head = ["Who", "Model", "Calls", "Fresh in", "Cache write", "Cache read", "Output", "~list $"]
+    if pts_col:
+        head.append("~weekly pts")
+    out = [f"Thread usage ({rep['harness']}, {_span(rep['first'], rep['last'])})", "",
+           "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+
+    def cells(who, mdl, r, bold=False):
+        v = r["usd"]
+        c = [who, mdl, str(r["calls"] or "-"), _k(r["input"]), _k(r["cache_write"]),
+             _k(r["cache_read"]), _k(r["output"]), "n/a" if v is None else f"{v:.2f}"]
+        if pts_col:
+            p = r.get("weekly_points")
+            c.append("n/a" if p is None else f"{p:.1f}")
+        if bold:
+            c = [("**" + x + "**") if x and i in (0, 7, 8) else x for i, x in enumerate(c)]
+        return "| " + " | ".join(c) + " |"
+
+    for r in s["rows"]:
+        out.append(cells(r["who"][:42], r["model"], r))
+    if len(s["rows"]) > 1:
+        out.append(cells("total", "", s["total"], bold=True))
+    if not s["rows"]:
+        out.append("| (no usage recorded) |" + " |" * (len(head) - 1))
+    out.append("")
+    if prices is None:
+        out.append("Costs: n/a, no usable price table.")
+    else:
+        line = (f"~list $ = tokens at API list prices from {prices['path']} "
+                f"(as of {prices['as_of']}). A yardstick, not a bill.")
+        age = _days_old(prices["as_of"])
+        if age is not None and age > STALE_PRICE_DAYS:
+            line += f" The table is {age} days old: check it."
+        out.append(line)
+    if s["unpriced_models"]:
+        out.append("No price for: " + ", ".join(s["unpriced_models"])
+                   + ". Their cost is not in the total.")
+    if pts_col and s["rows"]:
+        t = s["total"]
+        line = f"About {t['weekly_points']:.1f} points of the weekly limit"
+        for name, v in sorted(t["bucket_points"].items()):
+            line += f", {v:.1f} of the {name} limit"
+        out.append(line + f" (estimate, fitted {calib['fitted']} from your own history).")
+    if rep.get("bad_lines"):
+        out.append(f"{rep['bad_lines']} unreadable transcript line(s) were skipped.")
+    return "\n".join(out)
+
+
+def report_json(rep, prices, calib):
+    s = summarize(rep, prices, calib)
+    return {**{k: rep[k] for k in ("harness", "transcript", "first", "last", "main", "agents",
+                                   "bad_lines")}, "estimate": s}
+
+
+# ---------------------------------------------------------------- calibration
+
+def _to_epoch(ts):
+    if isinstance(ts, bool):
+        raise ValueError("bad timestamp")
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    return datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
+
+
+def load_history(path):
+    """Return (snapshots sorted by time, skipped count) from a file or folder of *.json."""
+    files = sorted(glob.glob(os.path.join(path, "*.json"))) if os.path.isdir(path) else [path]
+    if not files or not all(os.path.exists(f) for f in files):
+        raise UsageError(f"no history file found at {path}")
+    snaps, skipped = [], 0
+    for f in files:
+        try:
+            with open(f) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise UsageError(f"cannot read history file {f}: {e}")
+        items = data.get("snapshots") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            raise UsageError(f"history file {f} needs a \"snapshots\" list")
+        for x in items:
+            try:
+                buckets = {str(k): float(v) for k, v in (x.get("buckets") or {}).items()}
+                snaps.append({"t": _to_epoch(x["timestamp"]), "weekly": float(x["weekly"]),
+                              "buckets": buckets})
+            except (KeyError, TypeError, ValueError, AttributeError):
+                skipped += 1
+    snaps.sort(key=lambda x: x["t"])
+    return snaps, skipped
+
+
+def calibrate(history_path, days=35, save=True, out=print):
+    """Fit points-per-dollar from your own weekly history and this machine's transcripts."""
+    snaps, skipped = load_history(history_path)
+    peaks, prev = [], None
+    for x in snaps:
+        if prev and x["weekly"] < prev["weekly"] - RESET_DROP:
+            peaks.append(prev)
+        prev = x
+    cutoff = datetime.now().timestamp() - days * 86400
+    peaks = [p for p in peaks if p["t"] > cutoff]
+    if len(peaks) < 2:
+        raise UsageError(f"fewer than two weekly resets in the last {days} days of "
+                         f"{history_path}: cannot calibrate")
+    prices = resolve_prices(None)
+    if prices is None:
+        raise UsageError("calibrating needs a usable price table")
+    names = sorted({n for p in peaks for n in p["buckets"]})
+    edges = [p["t"] for p in peaks]
+    spend = defaultdict(lambda: defaultdict(float))  # week index -> "weekly"/bucket -> dollars
+    seen, unpriced = set(), set()
+    files = glob.glob(os.path.join(claude_projects_dir(), "**", "*.jsonl"), recursive=True)
+    files = [f for f in files if os.path.getmtime(f) >= edges[0]]
+    print(f"session-usage: scanning {len(files)} transcript file(s) under "
+          f"{claude_projects_dir()} (read-only)", file=sys.stderr)
+    for f in files:
+        with open(f, errors="ignore") as fh:
+            for line in fh:
+                if '"usage"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                    msg = d["message"]
+                    t = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+                except (ValueError, KeyError, TypeError, AttributeError):
+                    continue
+                key = d.get("requestId") or msg.get("id")
+                if d.get("type") != "assistant" or key in seen or not msg.get("usage"):
+                    continue
+                seen.add(key)
+                u, b = msg["usage"], _blank()
+                b.update(input=u.get("input_tokens", 0), output=u.get("output_tokens", 0),
+                         cache_write=u.get("cache_creation_input_tokens", 0),
+                         cache_read=u.get("cache_read_input_tokens", 0))
+                model = msg.get("model") or ""
+                v = usd(model, b, prices)
+                if v is None:
+                    unpriced.add(model or "unknown")
+                    continue
+                for n in range(1, len(edges)):
+                    if edges[n - 1] <= t < edges[n]:
+                        spend[n]["weekly"] += v
+                        for name in names:
+                            if name in model:
+                                spend[n][name] += v
+    header = ["week ending", "weekly %", "$ value", "pts/$"]
+    for name in names:
+        header += [f"{name} %", f"{name} $", f"{name} pts/$"]
+    out(" | ".join(header))
+    sums = defaultdict(lambda: [0.0, 0.0])  # series -> [percent, dollars]
+    weeks = 0
+    for n in range(1, len(peaks)):
+        p, sp = peaks[n], spend[n]
+        row = [f"{datetime.fromtimestamp(p['t']):%Y-%m-%d}", f"{p['weekly']:g}",
+               f"{sp['weekly']:.0f}", f"{p['weekly'] / sp['weekly'] if sp['weekly'] else 0:.3f}"]
+        if sp["weekly"]:
+            sums["weekly"][0] += p["weekly"]
+            sums["weekly"][1] += sp["weekly"]
+            weeks += 1
+        for name in names:
+            pct = p["buckets"].get(name)
+            row += ["-" if pct is None else f"{pct:g}", f"{sp[name]:.0f}",
+                    f"{pct / sp[name] if pct is not None and sp[name] else 0:.3f}"]
+            if pct is not None and sp[name]:
+                sums[name][0] += pct
+                sums[name][1] += sp[name]
+        out(" | ".join(row))
+    if not sums["weekly"][1]:
+        raise UsageError("no priced transcript usage fell inside the weeks in the history: "
+                         "nothing to fit")
+    fit = {"fitted": datetime.now().strftime("%Y-%m-%d"), "weeks": weeks,
+           "weekly": round(sums["weekly"][0] / sums["weekly"][1], 4),
+           "buckets": {n: round(sums[n][0] / sums[n][1], 4) for n in names if sums[n][1]}}
+    out("")
+    out(f"Fitted points per list-price dollar: weekly {fit['weekly']}"
+        + "".join(f", {n} {v}" for n, v in fit["buckets"].items()) + f" ({weeks} week(s)).")
+    if skipped:
+        out(f"{skipped} history snapshot(s) were unreadable and skipped.")
+    if unpriced:
+        out("No price for: " + ", ".join(sorted(unpriced)) + ". Their usage is not in the dollars.")
+    out("Transcripts on this machine only. Usage from other machines or from web chat counts "
+        "toward your percentage but is not in these files, so the fitted value reads high.")
+    if save:
+        path = calibration_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(fit, fh, indent=2)
+            fh.write("\n")
+        out(f"Saved {path}")
+    else:
+        out("Not saved (--no-save).")
+    return fit
+
+
+# ---------------------------------------------------------------- command line
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="session-usage", description=__doc__.strip().split("\n\n")[0] + "\n\n"
+        + "  session-usage                 current Claude Code session ($CLAUDE_CODE_SESSION_ID)\n"
+        "  session-usage --session ID    a specific Claude Code session (an id or a transcript path)\n"
+        "  session-usage --codex [PATH]  Codex: that rollout file, or the newest one for this directory\n"
+        "  session-usage --calibrate --history PATH   fit the optional weekly-points column\n"
+        "  session-usage --json          machine-readable output",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--session", metavar="ID|PATH", default=None,
+                   help="Claude Code session id or transcript path")
+    g.add_argument("--codex", metavar="PATH", nargs="?", const="", default=None,
+                   help="read a Codex rollout (no PATH: newest for the current directory)")
+    g.add_argument("--calibrate", action="store_true",
+                   help="fit points-per-dollar from your weekly history (needs --history)")
+    ap.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    ap.add_argument("--prices", metavar="PATH", help="price table to use instead of the default")
+    ap.add_argument("--history", metavar="PATH",
+                    help="with --calibrate: weekly history file or folder (or $SESSION_USAGE_HISTORY)")
+    ap.add_argument("--days", type=int, default=35,
+                    help="with --calibrate: only weeks that ended in the last N days (default 35)")
+    ap.add_argument("--no-save", action="store_true",
+                    help="with --calibrate: print the fit, do not write calibration.json")
+    return ap
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    try:
+        if a.calibrate:
+            path = a.history or os.environ.get("SESSION_USAGE_HISTORY")
+            if not path:
+                raise UsageError("--calibrate needs your weekly history: pass --history PATH "
+                                 "(format in --help)")
+            calibrate(path, days=a.days, save=not a.no_save)
+            return 0
+        prices = resolve_prices(a.prices)
+        cwd = os.getcwd()
+        if a.codex is not None:
+            rep = codex_report(a.codex or None, cwd)
+        else:
+            rep = claude_report(a.session, cwd)
+        calib = load_calibration()
+        if a.json:
+            print(json.dumps(report_json(rep, prices, calib), indent=2))
+        else:
+            print(render(rep, prices, calib))
+        return 0
+    except UsageError as e:
+        warn(str(e))
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

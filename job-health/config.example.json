@@ -1,0 +1,25 @@
+[
+  {
+    "name": "nightly-backup",
+    "owner": "personal",
+    "probe": "log_file",
+    "path": "~/logs/nightly-backup.log",
+    "timestamp": "auto",
+    "ok_regex": "\\bDONE\\b",
+    "fail_regex": "\\b(FAIL|ERROR)\\b",
+    "max_age_hours": 26
+  },
+  {
+    "name": "notes-repo",
+    "owner": "work",
+    "probe": "git_repo",
+    "path": "~/src/notes",
+    "max_age_hours": 26
+  },
+  {
+    "name": "time-machine",
+    "owner": "personal",
+    "probe": "time_machine",
+    "max_age_hours": 24
+  }
+]

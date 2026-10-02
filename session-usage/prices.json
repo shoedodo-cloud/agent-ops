@@ -1,0 +1,17 @@
+{
+  "as_of": "2026-09-25",
+  "currency": "USD",
+  "unit": "per million tokens",
+  "source": "Anthropic API model table (list prices), read on the as_of date",
+  "cache_write_multiplier": 2,
+  "cache_write_note": "Cache writes are priced at this multiple of the input price. 2 is the one-hour cache rate. Use 1.25 for the five-minute cache.",
+  "models": [
+    {"match": "fable",      "input": 10, "output": 50, "cache_read": 0.25},
+    {"match": "opus-5-5",   "input": 4,  "output": 20, "cache_read": 0.20},
+    {"match": "opus",       "input": 5,  "output": 25, "cache_read": 0.50},
+    {"match": "sonnet-4",   "input": 3,  "output": 15, "cache_read": 0.30},
+    {"match": "sonnet",     "input": 2,  "output": 10, "cache_read": 0.20},
+    {"match": "haiku",      "input": 1,  "output": 5,  "cache_read": 0.10}
+  ],
+  "matching": "The first entry whose match text appears in the model name wins. Put specific names before general ones."
+}

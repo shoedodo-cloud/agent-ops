@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""session-start: print a verified baseline for the repo a coding-agent session opens in."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import sys
+import time
+from pathlib import Path
+
+HELP = """\
+Print a baseline for the current repo, for a coding agent to read before it acts.
+
+What it prints, each line either checked or marked "could not determine: <what> (why)":
+  branch          current branch, or detached HEAD
+  upstream        ahead/behind of the upstream branch, and how old that remote data is
+  uncommitted     number of paths in `git status --porcelain`
+  last note       newest file under $SESSION_NOTES_DIR (default notes/sessions), its first
+                  line, and its "Next session starts here" section
+  tracker         open items for this project from the configured tracker adapter
+
+It never merges, commits or writes a file. It talks to the network only for --fetch
+(one `git fetch` of the upstream remote) and for a tracker that lives online (Linear).
+Exit status is 0 whatever it finds, 2 only for a bad command line.
+
+Environment:
+  SESSION_NOTES_DIR      notes folder, relative to the repo root (default notes/sessions)
+  SESSION_PROJECT        project name for the tracker (default: the repo folder name)
+  SESSION_HOOKS_CONFIG   config file (default $HOME/.config/session-hooks/config.json)
+  SESSION_HOOKS_TRACKERS extra folder(s) with tracker adapters, searched first
+  SESSION_LEDGER         ledger file for the file tracker (default notes/ledger.md)
+  SESSION_HOOKS_HOME     the session-hooks folder, if this script was copied out of it
+"""
+
+
+def _module_home() -> Path | None:
+    candidates = []
+    if os.environ.get("SESSION_HOOKS_HOME"):
+        candidates.append(Path(os.path.expanduser(os.environ["SESSION_HOOKS_HOME"])))
+    candidates.append(Path(__file__).resolve().parent.parent)
+    for home in candidates:
+        if (home / "lib" / "sessionhooks.py").is_file() and (home / "trackers" / "base.py").is_file():
+            return home
+    return None
+
+
+def _age(seconds: float) -> str:
+    if seconds < 90:
+        return "just now"
+    minutes = seconds / 60
+    if minutes < 90:
+        return f"{int(minutes)} min ago"
+    hours = minutes / 60
+    if hours < 36:
+        return f"{int(hours)} h ago"
+    return f"{int(hours / 24)} days ago"
+
+
+class Out:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def ok(self, label: str, value: str) -> None:
+        self.lines.append(f"{label}: {value}")
+
+    def unknown(self, what: str, why: str) -> None:
+        self.lines.append(f"could not determine: {what} ({why})")
+
+    def sub(self, text: str) -> None:
+        self.lines.append(f"  {text}")
+
+    def flush(self) -> None:
+        print("\n".join(self.lines))
+
+
+def _git_block(sh, out: Out, root: Path, fetch: bool) -> bool:
+    """Branch, upstream, uncommitted. Returns True when a fetch ran."""
+    fetched = False
+    branch, branch_text = sh.current_branch(root)
+    if branch_text:
+        out.ok("branch", branch_text)
+    else:
+        out.unknown("branch", "git could not read HEAD")
+
+    upstream = sh.git_out(root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    if not upstream:
+        why = f"branch {branch!r} has no upstream branch" if branch else "no branch is checked out"
+        out.unknown("ahead/behind upstream", why)
+    else:
+        freshness = ""
+        if fetch:
+            remote = sh.git_out(root, "config", f"branch.{branch}.remote") if branch else None
+            if not remote or remote == ".":
+                out.unknown("fresh remote state", f"no remote to fetch for {upstream}")
+            else:
+                try:
+                    result = sh.git(root, "fetch", "--quiet", remote, timeout=60)
+                    if result.returncode == 0:
+                        fetched = True
+                        freshness = f"fetched {remote} just now"
+                    else:
+                        err = (result.stderr or "").strip().splitlines()
+                        out.unknown("fresh remote state",
+                                    f"git fetch {remote} failed: {err[-1] if err else 'exit ' + str(result.returncode)}")
+                except Exception as exc:  # timeout, git missing
+                    out.unknown("fresh remote state", f"git fetch {remote} failed: {type(exc).__name__}")
+        if not freshness:
+            fetch_head = sh.git_out(root, "rev-parse", "--git-path", "FETCH_HEAD")
+            path = Path(fetch_head) if fetch_head else None
+            if path is not None and not path.is_absolute():
+                path = root / path
+            if path is not None and path.exists():
+                freshness = f"as of the last fetch, {_age(time.time() - path.stat().st_mtime)}, --fetch refreshes"
+            else:
+                freshness = "no fetch recorded in this clone, remote data may be old, --fetch refreshes"
+        counts = sh.git_out(root, "rev-list", "--left-right", "--count", "HEAD...@{u}")
+        parts = counts.split() if counts else []
+        if len(parts) == 2:
+            out.ok("upstream", f"{upstream}, ahead {parts[0]}, behind {parts[1]} ({freshness})")
+        else:
+            out.unknown("ahead/behind upstream", f"git rev-list against {upstream} failed")
+
+    status = sh.git_out(root, "status", "--porcelain=v1", "--untracked-files=normal")
+    if status is None:
+        out.unknown("uncommitted changes", "git status failed")
+    else:
+        count = len([line for line in status.splitlines() if line.strip()])
+        out.ok("uncommitted", f"{count} path{'s' if count != 1 else ''} (git status --porcelain)")
+    return fetched
+
+
+def _note_block(sh, out: Out, env, base: Path) -> None:
+    folder = sh.notes_dir(env, base)
+    shown = sh.rel(folder, base)
+    if not folder.is_dir():
+        out.ok("last session note", f"none, {shown} does not exist")
+        return
+    note = sh.newest_note(folder)
+    if note is None:
+        out.ok("last session note", f"none, {shown} is empty")
+        return
+    out.ok("last session note", sh.rel(note, base))
+    try:
+        text = note.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        out.unknown("last session note contents", f"cannot read it: {exc.strerror or exc}")
+        return
+    lines = text.splitlines()
+    first = lines[0].strip() if lines else ""
+    out.sub(f"first line: {first[:200] if first else '(empty file)'}")
+    nxt = sh.section(text, sh.NEXT_HEADING)
+    if nxt:
+        out.sub(f"{sh.NEXT_HEADING.lower()}:")
+        for line in nxt[:5]:
+            out.sub(f"  {line.strip()[:200]}")
+        if len(nxt) > 5:
+            out.sub(f"  ... {len(nxt) - 5} more lines in the note")
+    else:
+        out.sub(f'no "{sh.NEXT_HEADING}" section in that note')
+
+
+def _tracker_block(sh, out: Out, config, env, base: Path, project: str, max_items: int) -> None:
+    from trackers.base import TrackerError
+
+    try:
+        tracker = sh.load_tracker(config, env, base)
+    except TrackerError as exc:
+        out.unknown("open tracker items", str(exc))
+        return
+    origin = f"from {config.path}" if config.found else "from defaults, no config file"
+    out.ok("tracker", f"{tracker.describe(project)}, {origin}")
+    try:
+        items = tracker.open_items(project)
+    except TrackerError as exc:
+        out.unknown("open tracker items", str(exc))
+        return
+    except Exception as exc:  # an adapter bug must not hide behind silence
+        out.unknown("open tracker items", f"adapter error {type(exc).__name__}: {exc}")
+        return
+    out.ok("open items", f"{len(items)} for {project}")
+    for item in items[:max_items]:
+        ident = item.get("id", "")
+        url = item.get("url", "")
+        tail = f"  {url}" if url and url != ident else ""
+        out.sub(f"- {ident} [{item.get('state', '')}] {item.get('title', '')}{tail}")
+    if len(items) > max_items:
+        out.sub(f"... and {len(items) - max_items} more")
+
+
+def run(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="session-start", description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--repo", default="", help="repo to describe (default: current directory)")
+    parser.add_argument("--fetch", action="store_true", help="run one `git fetch` of the upstream remote first")
+    parser.add_argument("--project", default="", help="project name for the tracker (default: repo folder name)")
+    parser.add_argument("--no-tracker", action="store_true", help="skip the tracker lookup")
+    parser.add_argument("--max-items", type=int, default=20, help="open items to list (default 20)")
+    args = parser.parse_args(argv)
+
+    home = _module_home()
+    if home is None:
+        print("could not determine: anything (lib/ and trackers/ not found next to this script. "
+              "Install with a symlink, or set SESSION_HOOKS_HOME to the session-hooks folder)")
+        return 0
+    for path in (str(home), str(home / "lib")):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    import sessionhooks as sh
+
+    env = dict(os.environ)
+    out = Out()
+    start = Path(os.path.expanduser(args.repo or ".")).resolve()
+    if not start.is_dir():
+        print(f"could not determine: anything ({start} is not a folder)")
+        return 0
+
+    try:
+        config = sh.load_config(env)
+        config_problem = ""
+    except sh.ConfigError as exc:
+        config = sh.Config(sh.config_path(env), False, {})
+        config_problem = str(exc)
+
+    root = sh.repo_root(start)
+    base = root or start
+    project, project_from = sh.resolve_project(args.project or None, env, base)
+    now = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    out.lines.append(f"== session-start: {project} ({project_from}) at {base}, {now} ==")
+    if config_problem:
+        out.unknown("config", f"{config_problem}, using defaults")
+
+    fetched = False
+    if root is None:
+        out.unknown("branch, upstream, uncommitted", f"{start} is not inside a git work tree")
+    else:
+        fetched = _git_block(sh, out, root, args.fetch)
+
+    _note_block(sh, out, env, base)
+
+    if args.no_tracker:
+        out.ok("tracker", "skipped (--no-tracker)")
+    else:
+        _tracker_block(sh, out, config, env, base, project, max(0, args.max_items))
+
+    out.lines.append("read-only: nothing merged, committed or written"
+                     + (", one git fetch ran" if fetched else ", no git fetch"))
+    out.flush()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return run(argv)
+    except SystemExit:
+        raise
+    except Exception as exc:  # a bug here must not block the session from starting
+        print(f"could not determine: baseline (internal error {type(exc).__name__}: {exc})")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
