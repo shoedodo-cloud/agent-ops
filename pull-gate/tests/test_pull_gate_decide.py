@@ -333,3 +333,15 @@ def test_help_documents_the_config_and_the_defaults(tmp_path):
         assert word in result.stdout, word
     assert run_cli(tmp_path, None, "check", "--help").returncode == 0
     assert run_cli(tmp_path, None, "decide", "--help").returncode == 0
+
+
+def test_a_non_plain_mode_under_a_safe_prefix_needs_a_person():
+    v = pg.decide(["status/host-a.md"], "alpha", policy(), {"status/host-a.md": "120000"})
+    assert v.verdict == pg.MANUAL and v.cause == "exec"
+
+
+def test_example_patterns_cover_agent_config_files():
+    pol = policy()
+    for path in (".envrc", ".mcp.json", "CLAUDE.md", "sub/AGENTS.md", ".gitattributes",
+                 ".gitmodules", "package.json", ".claude/settings.local.json", ".claude/commands/x.md"):
+        assert pol.is_exec(path), path

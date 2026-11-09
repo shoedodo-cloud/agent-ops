@@ -243,7 +243,7 @@ def test_a_broken_loop_body_announces_itself(tmp_path):
     (shim / "git").write_text(
         "#!/bin/bash\n"
         'for a in "$@"; do\n'
-        '  if [ "$a" = "--name-only" ]; then exit 3; fi\n'
+        '  if [ "$a" = "--raw" ]; then exit 3; fi\n'
         "done\n"
         'exec "%s" "$@"\n' % GIT)
     (shim / "git").chmod(0o755)
@@ -521,3 +521,61 @@ def test_the_check_root_can_be_the_repo_itself(tmp_path):
     w.push_from_peer("alpha", "status/host-a.md")
     code, out = w.run("--root", str(w.root / "alpha"), wrapper=False)
     assert code == 0 and "AUTO-FAST-FORWARDED" in out, out
+
+
+# --- file modes: a symlink or executable under a safe prefix never merges alone ----
+
+def _push_symlink_from_peer(w, name, rel, target):
+    repo = w.tmp / "peer" / name
+    link = repo / rel
+    link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(target, link)
+    w.git(repo, "add", rel)
+    w.git(repo, "commit", "-qm", "peer link")
+    w.git(repo, "push", "-q", "origin", "HEAD:main")
+
+
+def test_incoming_symlink_under_a_safe_prefix_is_not_auto_merged(tmp_path):
+    w = world_with(tmp_path, "alpha")
+    _push_symlink_from_peer(w, "alpha", "status/host-a.md", "../../home/.zshrc")
+    out = w.check()
+    assert "AUTO-FAST-FORWARDED" not in out, out
+    assert "mode 120000, not a plain file" in out
+    assert w.ahead_behind("alpha") == (0, 1)
+
+
+def test_incoming_executable_bit_under_a_safe_prefix_is_not_auto_merged(tmp_path):
+    w = world_with(tmp_path, "alpha")
+    repo = w.tmp / "peer" / "alpha"
+    write_file(repo, "status/run.md", "#!/bin/sh\n")
+    (repo / "status" / "run.md").chmod(0o755)
+    w.git(repo, "add", "status/run.md")
+    w.git(repo, "commit", "-qm", "exec")
+    w.git(repo, "push", "-q", "origin", "HEAD:main")
+    out = w.check()
+    assert "AUTO-FAST-FORWARDED" not in out, out
+    assert "mode 100755" in out
+
+
+def test_git_runs_with_repo_hooks_switched_off(tmp_path):
+    """A post-merge hook planted in the repo's own .git must not run on the auto fast-forward."""
+    w = world_with(tmp_path, "alpha")
+    marker = tmp_path / "hook-ran"
+    hook = w.root / "alpha" / ".git" / "hooks" / "post-merge"
+    hook.write_text("#!/bin/sh\ntouch '%s'\n" % marker)
+    hook.chmod(0o755)
+    w.push_from_peer("alpha", "status/host-a.md")
+    out = w.check()
+    assert "AUTO-FAST-FORWARDED" in out, out
+    assert not marker.exists()
+
+
+def test_parse_raw_diff_flags_only_non_plain_modes():
+    pg = load_gate()
+    z = "0" * 40
+    raw = (":000000 100644 %s %s A\0a.md\0" % (z, z) +
+           ":000000 120000 %s %s A\0b.md\0" % (z, z) +
+           ":100644 000000 %s %s D\0c.md\0" % (z, z))
+    paths, modes = pg.parse_raw_diff(raw)
+    assert paths == ["a.md", "b.md", "c.md"]
+    assert modes == {"b.md": "120000"}

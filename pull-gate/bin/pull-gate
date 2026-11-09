@@ -199,19 +199,30 @@ def _first(classes: Dict[str, List[str]], key: str, suffix: str) -> str:
     return "%s%s %s" % (_show(items[0]), more, suffix)
 
 
-def decide(paths: Sequence[str], repo: str, policy: Policy) -> Decision:
-    """May these incoming paths be fast-forwarded without a person?"""
+def decide(paths: Sequence[str], repo: str, policy: Policy,
+           modes: Optional[Dict[str, str]] = None) -> Decision:
+    """May these incoming paths be fast-forwarded without a person?
+
+    modes maps a path to its incoming git mode when that is not a plain file (100644): a
+    symlink (120000), an executable (100755) or a submodule (160000). Such a path counts as
+    executable whatever its name, so a symlink under a safe prefix is never merged alone."""
     clean = [p for p in paths if p]
+    modes = modes or {}
     classes: Dict[str, List[str]] = {"suspicious": [], "exec": [], "safe": [], "unclassified": []}
     if not clean:
         return Decision(MANUAL, "nothing incoming", "empty", classes)
     for path in clean:
-        classes[classify(path, policy)].append(path)
+        kind = classify(path, policy)
+        if kind != "suspicious" and path in modes:
+            classes["exec"].append("%s (mode %s, not a plain file)" % (path, modes[path]))
+        else:
+            classes[kind].append(path)
     if classes["suspicious"]:
         return Decision(MANUAL, _first(classes, "suspicious", "is a suspicious path, refused"),
                         "suspicious", classes)
     if classes["exec"]:
-        return Decision(MANUAL, _first(classes, "exec", "matches an exec pattern, needs a person"),
+        return Decision(MANUAL, _first(classes, "exec", "matches an exec pattern or is not a plain "
+                                       "file, needs a person"),
                         "exec", classes)
     if classes["unclassified"]:
         return Decision(NO_VERDICT,
@@ -230,6 +241,14 @@ def decide(paths: Sequence[str], repo: str, policy: Policy) -> Decision:
 # git plumbing
 # ---------------------------------------------------------------------------
 
+# The repos under the root are not all trusted: an unpacked archive can carry its own .git/config.
+# These switch off the repo-local settings that run a program during fetch, status or merge.
+# They do not make an untrusted .git/config safe (url.*.insteadOf, core.sshCommand and others
+# remain), so point PULL_GATE_ROOT at a folder that holds only your own clones.
+GIT_HARDENING = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                 "-c", "protocol.ext.allow=never"]
+
+
 def _git_env() -> Dict[str, str]:
     drop = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR")
     env = {k: v for k, v in os.environ.items() if k not in drop}
@@ -244,7 +263,7 @@ def _git(repo: str, *args: str, timeout: Optional[float] = None,
          detach: bool = False) -> Tuple[int, str, str]:
     """Run git in repo. Returns (exit code, stdout, stderr). Never raises on a git failure."""
     try:
-        proc = subprocess.Popen(["git", "-C", repo] + list(args), stdin=subprocess.DEVNULL,
+        proc = subprocess.Popen(["git", "-C", repo] + GIT_HARDENING + list(args), stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 env=_git_env(), start_new_session=detach)
     except OSError as exc:
@@ -336,9 +355,31 @@ def _maybe_fetch(repo: str, branch: str, ctx: Context) -> str:
     remaining = ctx.deadline - time.monotonic()
     if remaining <= 0:
         return "fetch skipped, the time budget is used up"
-    rc, out, err = _git(repo, "fetch", "--quiet", "--no-tags", "origin", branch,
+    # A full ref name can never be read as an option, whatever HEAD says the branch is called.
+    rc, out, err = _git(repo, "fetch", "--quiet", "--no-tags", "origin", "refs/heads/" + branch,
                         timeout=min(ctx.fetch_timeout, remaining), detach=True)
     return "" if rc == 0 else "fetch failed (%s)" % _why(out, err, rc)
+
+
+def parse_raw_diff(out: str) -> Tuple[List[str], Dict[str, str]]:
+    """Paths from `git diff --raw -z --no-renames`, and the incoming mode of each path that is
+    not a plain file. A deleted path (new mode 000000) is a plain removal and is not flagged."""
+    fields = out.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 2:
+        raise ValueError("odd number of fields")
+    paths: List[str] = []
+    modes: Dict[str, str] = {}
+    for meta, path in zip(fields[0::2], fields[1::2]):
+        parts = meta.split()
+        if not meta.startswith(":") or len(parts) < 5:
+            raise ValueError("unexpected record %r" % meta[:40])
+        new_mode = parts[1]
+        paths.append(path)
+        if new_mode not in ("100644", "000000"):
+            modes[path] = new_mode
+    return paths, modes
 
 
 def _listing(title: str, items: List[str]) -> List[str]:
@@ -383,11 +424,14 @@ def examine(repo: str, ctx: Context) -> Result:
         # Up to date, or only ahead. Unpushed work is not an incoming change.
         return Result("finding" if notes else "current", name, notes)
 
-    rc, out, err = _git(repo, "diff", "--name-only", "-z", "--no-renames", "HEAD...%s" % ref)
+    rc, out, err = _git(repo, "diff", "--raw", "-z", "--no-renames", "--no-abbrev", "HEAD...%s" % ref)
     if rc != 0:
         raise CannotDecide("cannot list incoming files (%s)" % _why(out, err, rc))
-    paths = [p for p in out.split("\0") if p]
-    verdict = decide(paths, name, ctx.policy)
+    try:
+        paths, modes = parse_raw_diff(out)
+    except ValueError as exc:
+        raise CannotDecide("cannot parse the incoming file list (%s)" % exc)
+    verdict = decide(paths, name, ctx.policy, modes)
 
     lines = list(notes)
     refused = ""

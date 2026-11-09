@@ -110,9 +110,10 @@ It reports. It does not pass silently.
   where it is. List only files that are generated and never run.
 - `exec_patterns` lists known-bad shapes. A script with an unusual name is "unclassified", not
   "executable". It still does not auto-merge, but read the unclassified list.
-- Compares only with `origin/<current branch>`. Submodules and symlink targets are not looked at.
+- Compares only with `origin/<current branch>`. A symlink, executable or submodule never merges alone.
 - File names are data. Control characters are escaped, but a name can still contain words.
-- A fetch can use your credential helper or SSH agent. Prompts are off and fetches are time-boxed.
+- Git runs with repo hooks and fsmonitor off, but other repo-local settings in `.git/config` still
+  apply. Point the root only at a folder of your own clones, never at unpacked downloads.
 - POSIX only. The test suite runs on Ubuntu and macOS in CI. The tool itself was exercised by
   hand on macOS only.
 

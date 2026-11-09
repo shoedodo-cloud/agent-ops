@@ -19,6 +19,12 @@
     "settings.*\\.json$",
     "\\.plist$",
     "hooks?/",
-    "(^|/)Makefile$"
+    "(^|/)Makefile$",
+    "(^|/)\\.envrc$",
+    "(^|/)\\.mcp\\.json$",
+    "(^|/)(CLAUDE|AGENTS)\\.md$",
+    "(^|/)\\.git(attributes|modules)$",
+    "(^|/)package\\.json$",
+    "(^|/)\\.claude/"
   ]
 }
