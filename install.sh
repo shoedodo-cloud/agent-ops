@@ -8,6 +8,15 @@ PREFIX="${PREFIX:-$HOME/.local/bin}"
 AOH="${AGENT_OPS_HOME:-$HOME/.local/share/agent-ops}"
 case "$AOH" in /*) ;; *) AOH="$PWD/$AOH" ;; esac
 AOH="${AOH%/}"
+# Install and uninstall delete $AOH/<module>. Refuse a home that would make that a folder of
+# yours: the filesystem root, your home itself, or the repo you are installing from.
+HOME_REAL=$(cd "$HOME" 2>/dev/null && pwd -P || echo "$HOME")
+AOH_REAL=$(cd "$AOH" 2>/dev/null && pwd -P || echo "$AOH")
+case "$AOH_REAL" in
+  "" | / | "$HOME_REAL" | "$ROOT")
+    echo "AGENT_OPS_HOME=$AOH is not a folder of its own (it is /, your home or this repo). Unset it or pick a new folder." >&2
+    exit 1 ;;
+esac
 
 usage() {
   cat <<EOF
@@ -88,7 +97,7 @@ install_module() {
   for f in "$dest/bin"/*; do
     if [ -f "$f" ]; then
       chmod +x "$f"
-      ln -sf "$f" "$PREFIX/$(basename "$f")"
+      ln -sfn "$f" "$PREFIX/$(basename "$f")"
     fi
   done
   echo "Installed $1 -> $dest"

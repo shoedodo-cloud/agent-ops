@@ -245,3 +245,26 @@ def test_warns_when_prefix_is_not_on_path(env):
     assert "not on your PATH" in run(env, "secret-sweep").stdout
     env["PATH"] = env["PREFIX"] + os.pathsep + os.environ["PATH"]
     assert "not on your PATH" not in run(env, "secret-sweep").stdout
+
+
+@pytest.mark.parametrize("where", ["home", "root"])
+def test_refuses_an_agent_ops_home_that_is_not_its_own_folder(env, where):
+    env = dict(env)
+    env["AGENT_OPS_HOME"] = env["HOME"] if where == "home" else "/"
+    r = run(env, "secret-sweep")
+    assert r.returncode == 1
+    assert "not a folder of its own" in r.stderr
+    r = run(env, "--uninstall", "secret-sweep")
+    assert r.returncode == 1
+
+
+def test_a_link_name_that_is_a_symlink_to_a_folder_is_replaced_not_entered(env, tmp_path):
+    prefix = Path(env["PREFIX"])
+    prefix.mkdir()
+    folder = tmp_path / "some-folder"
+    folder.mkdir()
+    link = prefix / "secret-sweep"
+    link.symlink_to(folder)
+    assert run(env, "--force", "secret-sweep").returncode == 0
+    assert os.readlink(link).endswith("secret-sweep/bin/secret-sweep")
+    assert list(folder.iterdir()) == []          # no link was written inside the folder
