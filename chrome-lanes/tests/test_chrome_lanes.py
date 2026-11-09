@@ -181,7 +181,7 @@ def test_claim_held_by_live_other_pid(tmp_path, monkeypatch, capsys):
                "project": "otherproj", "since": "2026-01-01T00:00:00+00:00", "last_used": now_iso()})
     assert cl.cmd_claim(["Alice Personal", "--pid", str(other + 1)]) == 4
     err = capsys.readouterr().err
-    assert "HELD:" in err and f"pid {other}" in err and "ask the user" in err
+    assert "HELD:" in err and f"pid {other}" in err and "Queue for it" in err
     assert json.loads(f.read_text())["project"] == "otherproj"
 
 
@@ -839,3 +839,49 @@ def test_help_exits_zero_and_names_every_command(capsys):
         assert word in out
     assert cl.main(["claim", "--help"]) == 0
     assert cl.main(["bogus"]) == 2
+
+
+# ---------- --no-takeover (background jobs) and queueing ----------
+
+def test_no_takeover_leaves_an_idle_holder_alone(tmp_path, monkeypatch, capsys):
+    d = _setup_lease_env(tmp_path, monkeypatch)
+    other = os.getpid()
+    _lease_idle(d, FAKE_ROW, 60, other, "person")
+    assert cl.cmd_claim(["Alice Personal", "--pid", str(other + 1), "--project", "cron",
+                         "--no-takeover"]) == 4
+    err = capsys.readouterr().err
+    assert "HELD" in err and "TAKEN OVER" not in err
+    assert json.loads((d / f"{FAKE_ROW['deviceId']}.json").read_text())["project"] == "person"
+    assert not (d / "taken" / f"{other}.json").exists()
+
+
+def test_no_takeover_still_claims_a_free_turn(tmp_path, monkeypatch, capsys):
+    d = _setup_lease_env(tmp_path, monkeypatch)
+    assert cl.cmd_claim(["Alice Personal", "--pid", "77", "--project", "cron", "--no-takeover"]) == 0
+    assert json.loads((d / f"{FAKE_ROW['deviceId']}.json").read_text())["project"] == "cron"
+
+
+def test_no_takeover_with_force_is_a_usage_error(tmp_path, monkeypatch, capsys):
+    _setup_lease_env(tmp_path, monkeypatch)
+    assert cl.cmd_claim(["Alice Personal", "--force", "--no-takeover"]) == 2
+    assert "cannot be combined" in capsys.readouterr().err
+
+
+def test_held_hint_tells_the_agent_to_queue(tmp_path, monkeypatch, capsys):
+    d = _setup_lease_env(tmp_path, monkeypatch)
+    other = os.getpid()
+    _lease_idle(d, FAKE_ROW, 1, other, "busy")
+    assert cl.cmd_claim(["Alice Personal", "--pid", str(other + 1)]) == 4
+    err = capsys.readouterr().err
+    assert "Queue for it" in err and "--wait 590" in err
+
+
+def test_wait_with_no_takeover_keeps_queueing(tmp_path, monkeypatch, capsys):
+    d = _setup_lease_env(tmp_path, monkeypatch)
+    other = os.getpid()
+    _lease_idle(d, FAKE_ROW, 60, other, "person")
+    clock = iter(range(0, 10_000, 10))
+    monkeypatch.setattr(cl.time, "time", lambda: next(clock))
+    monkeypatch.setattr(cl.time, "sleep", lambda s: None)
+    assert cl.cmd_claim(["Alice Personal", "--pid", str(other + 1), "--no-takeover", "--wait", "30"]) == 4
+    assert json.loads((d / f"{FAKE_ROW['deviceId']}.json").read_text())["project"] == "person"

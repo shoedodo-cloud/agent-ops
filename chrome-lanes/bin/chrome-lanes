@@ -18,14 +18,20 @@ Usage:
   chrome-lanes snapshot [--peers]
         Scan now and write the snapshot. --peers also fetches the profiles of
         every machine in CHROME_LANES_HOSTS over ssh.
-  chrome-lanes claim NAME [--project P] [--ttl HOURS] [--wait SECONDS] [--force]
+  chrome-lanes claim NAME [--project P] [--ttl HOURS] [--wait SECONDS] [--force | --no-takeover]
         Take the Chrome turn for this session, in the one profile matching NAME.
         The turn is machine-wide: a live lease of another session, in any
         profile, means HELD (exit 4). --wait polls every 10 s until the turn is
         free or the time is up. A holder idle for CHROME_LANES_STALE_MINUTES or
         more is taken over without --force. --force takes over at once: use it
-        only when the user says so. The old holder's next browser call gets a
+        only when the user says so. --no-takeover (for background jobs and
+        scheduled tasks) never takes the turn over, not even from an idle
+        holder: it gets HELD (exit 4) instead. Combined with --force it is a
+        usage error (exit 2). The old holder's next browser call gets a
         CHROME LEASE TAKEN OVER note from the guard.
+        Queueing: an agent whose tool calls time out (often at 10 min) repeats
+        `claim NAME --wait 590` until it gets the turn. The idle takeover
+        keeps the queue moving when a holder walks away.
   chrome-lanes release NAME | --all [--force]
         Drop this session's lease by name, or every lease it holds. A live lease
         of another session is NOT YOURS (exit 4) unless --force.
@@ -572,6 +578,7 @@ def cmd_claim(argv):
 
 def _claim_once(argv):
     project, pid_override, ttl_hours, force, positional, i = None, None, LEASE_TTL_HOURS, False, [], 0
+    no_takeover = False             # background jobs: never take an idle holder's turn
     try:
         while i < len(argv):
             a = argv[i]
@@ -583,10 +590,15 @@ def _claim_once(argv):
                 ttl_hours = _opt(argv, i, float); i += 2
             elif a == "--force":
                 force = True; i += 1
+            elif a == "--no-takeover":
+                no_takeover = True; i += 1
             else:
                 positional.append(a); i += 1
     except OptError as e:
         print(f"claim: {e}", file=sys.stderr)
+        return 2
+    if force and no_takeover:
+        print("claim: --force and --no-takeover cannot be combined", file=sys.stderr)
         return 2
     if not positional:
         print("claim: NAME required", file=sys.stderr)
@@ -614,13 +626,14 @@ def _claim_once(argv):
         if is_mine(other, my_pid) or not lease_alive(other):
             continue
         idle, take = idle_text(other), force
-        if not take and idle_minutes(other) >= limit:
+        if not take and not no_takeover and idle_minutes(other) >= limit:
             take = True; idle += f", over the {limit} min stuck threshold"
         if not take:
             print(f"HELD: the Chrome turn on this machine belongs to pid {other.get('pid')}, project "
                   f"{other.get('project')}, in {other.get('profileName')} since {other.get('since')} "
-                  f"({idle}). One session drives Chrome at a time. Wait (`chrome-lanes claim {name!r} "
-                  f"--wait 600`), do other work, or ask the user. Use --force only if the user says so.",
+                  f"({idle}). One session drives Chrome at a time. Queue for it: repeat "
+                  f"`chrome-lanes claim {name!r} --wait 590` until it returns the turn, doing other "
+                  f"work meanwhile. Use --force only if the user says so.",
                   file=sys.stderr)
             return 4
         print(f"TAKEN OVER the Chrome turn from pid {other.get('pid')}, project {other.get('project')} "
@@ -808,7 +821,7 @@ def taken_over_note():
     return (f"CHROME LEASE TAKEN OVER: your claim on {info.get('profileName')} was taken by pid "
             f"{info.get('by_pid')}, project {info.get('by_project')}, on {info.get('by_machine') or 'this machine'} "
             f"(idle over {stale_minutes()} min, or forced). Do not drive Chrome now. Claim again with "
-            f"`chrome-lanes claim <name> --wait 600`, or stop and ask the user.")
+            f"`chrome-lanes claim <name> --wait 590`, or stop and ask the user.")
 
 
 def cmd_guard(argv):

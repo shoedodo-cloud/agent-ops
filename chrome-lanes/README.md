@@ -24,7 +24,7 @@ touches lane 1. See [playwright-lane/README.md](playwright-lane/README.md).
 
 ```sh
 chrome-lanes lookup work --cached     # device id, machine, dir, name, account, label
-chrome-lanes claim work --wait 600    # take the Chrome turn, prints the device id
+chrome-lanes claim work --wait 590    # take the Chrome turn, prints the device id
 #   then in the agent: select_browser <device id>, and work in its own tabs
 chrome-lanes release --all            # give the turn back when the browser part is done
 chrome-lanes status                   # who holds what, clears dead leases
@@ -37,10 +37,17 @@ long it has been idle. `chrome-lanes --help` is the full reference.
 
 A paragraph you can paste into `CLAUDE.md` or `AGENTS.md`:
 
-> Before using Claude in Chrome, run `chrome-lanes claim <profile> --wait 600` and select the
+> Before using Claude in Chrome, run `chrome-lanes claim <profile> --wait 590` and select the
 > device id it prints with `select_browser`. Never call `switch_browser`. HELD means another
-> session has the turn: wait, do other work, or ask the user. Use `--force` only when the user
-> says so. Run `chrome-lanes release --all` as soon as the browser part is done.
+> session has the turn: queue for it by repeating the same claim until it returns the turn,
+> doing other work meanwhile. Use `--force` only when the user says so. Run
+> `chrome-lanes release --all` as soon as the browser part is done.
+
+**Queueing and background jobs.** `--wait 590` stays under the 10-minute limit many agent
+harnesses put on one tool call; repeat it to stay in the queue. A holder idle for
+`CHROME_LANES_STALE_MINUTES` is taken over, so the queue moves even when a session walks away.
+A scheduled or background job should claim with `--no-takeover`: it then never takes the turn
+from a person's idle session and gets HELD (exit 4) instead.
 
 ## Config
 

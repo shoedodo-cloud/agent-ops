@@ -64,7 +64,7 @@ Two lanes. Lane 1 is Claude in Chrome, one session at a time, under the lease. L
 Playwright MCP in extension mode, paired by token to one dedicated profile, so it needs no lease.
 
 ```
-$ chrome-lanes claim work --wait 600
+$ chrome-lanes claim work --wait 590
 claimed: work <device id> pid 4242
 $ chrome-lanes release --all
 released: work <device id>
