@@ -1,10 +1,57 @@
 # agent-ops
 
-Small, independent tools for engineers who run coding agents (Claude Code, Codex, OpenCode) on
-their own machines. Each one deals with one thing that goes wrong when agents run unattended or
-several run at once. Each installs alone and ships with hermetic tests. None of them edits your
-harness settings: you get the snippet and paste it yourself. Each one exists because the thing it
+Small, independent tools for people who run several coding agents (Claude Code, Codex, OpenCode)
+on their own machines, often at once and often unattended. Each tool fixes one thing that breaks
+in that setup. Each installs alone, ships with hermetic tests and never edits your harness
+settings: you get the snippet and paste it yourself. Every one of them exists because the thing it
 guards against happened at least once.
+
+The first tool, and the reason this repo exists, is **chrome-lanes**: it lets several agent
+sessions share Claude in Chrome without fighting over it.
+
+## Start here: chrome-lanes
+
+Claude in Chrome lets an agent work in your real browser, with your sign-ins. Out of the box it
+was built for one session at a time. Run two or three, or restart Chrome, and it gets in the way:
+
+- Every open Chrome profile shows up as "Browser 1", "Browser 2" and so on, numbered by the order
+  they connected. Restart Chrome and the numbers move. The agent cannot tell your work profile
+  from your personal one, so it asks you to pick from a list of numbers or long device ids.
+- A new session starts on whatever browser the last session selected, which may be another
+  person's profile or the wrong account.
+- When an agent calls `switch_browser`, every Chrome window shows a Connect prompt, and the
+  selection moves under every other running session as well.
+- The selected browser is shared by all sessions on the machine. Two sessions at once flip each
+  other's target, so one agent's clicks land in the profile the other one chose.
+
+chrome-lanes fixes this from the outside, without touching the extension:
+
+- **Profiles by name.** Each profile's extension storage keeps a persistent device id and the
+  label you typed when you connected it. chrome-lanes reads that storage (read-only) and maps it
+  to the profile's name and account. The agent asks for `work` and gets the right device id,
+  today and after every restart. No more numbers, no more pasted ids.
+- **No Connect prompts.** The snippet denies `switch_browser`. The agent selects the id
+  chrome-lanes gives it with `select_browser`, which asks nothing of the other windows.
+- **One session at a time, by agreement.** `claim` gives one session the Chrome turn and tells
+  the others who holds it, in which project, and for how long it has been idle. They queue with
+  `--wait` and get the turn when it is released. A holder that walks away is taken over after 15
+  idle minutes, so a forgotten session cannot block everyone.
+- **A session knows when it lost the turn.** A hook stamps each browser call. If another session
+  took over, the old holder's next browser call is stopped once with a note saying who took it,
+  instead of quietly clicking in someone else's profile.
+- **Background jobs that never steal a person's turn.** A scheduled job claims with
+  `--no-takeover` and waits behind you, even when your session looks idle.
+- **More than one machine.** Profiles on another machine show up in the same list over ssh, and
+  a claim there places the lease on that machine too, so its sessions see HELD as well.
+- **A second lane beside it.** The Playwright MCP in extension mode works only in one dedicated
+  profile that holds none of your sign-ins. It needs no turn, so a research job can run there
+  while another session holds Claude in Chrome.
+
+What this makes possible: several agents on one machine using your real browser on the same day,
+each in the profile it was meant for, queueing instead of colliding, with no prompts in your
+other windows and no "which Browser N is yours?" questions. The lease is a convention, not a lock:
+it works when every session follows it, which the paragraph in
+[chrome-lanes/README.md](chrome-lanes/README.md) tells your agents to do.
 
 ## Pick a tool
 
@@ -54,11 +101,8 @@ Then read the setup steps the installer prints.
 
 ### chrome-lanes
 
-Claude in Chrome shows each open Chrome profile as "Browser N", numbered by connection order. The
-numbers change at every restart, and two sessions at once flip each other's selected browser.
-`chrome-lanes` reads each profile's extension storage, read-only, where the device id and label
-persist, so an agent picks a browser by profile name. A lease gives one session the Chrome turn,
-with wait, force and idle takeover. A hook tells a session when its turn was taken.
+Picks a Chrome profile by name and gives one session at a time the Chrome turn. The full
+story is in [Start here](#start-here-chrome-lanes) above.
 
 Two lanes. Lane 1 is Claude in Chrome, one session at a time, under the lease. Lane 2 is the
 Playwright MCP in extension mode, paired by token to one dedicated profile, so it needs no lease.
