@@ -310,7 +310,21 @@ def latest_values(directory, wanted, errors=None):
 def profiles():
     with open(os.path.join(profile_root(), "Local State"), "rb") as f:
         info = json.load(f)["profile"]["info_cache"]
-    return {d: (v.get("name", "?"), v.get("user_name", "")) for d, v in info.items()}
+    if not isinstance(info, dict):
+        raise ValueError("Local State profile.info_cache is not an object")
+    return {str(d): (str(v.get("name", "?")), str(v.get("user_name", "")))
+            for d, v in info.items() if isinstance(v, dict)}
+
+
+_LABEL_BAD = re.compile(r"[^A-Za-z0-9._@ -]")
+
+
+def safe_name(value, limit=64):
+    """A project or profile name as it may appear in another session's messages. Those
+    messages reach a model, so a folder name must not be able to carry lines or instructions
+    longer than a name."""
+    text = _LABEL_BAD.sub("_", str(value if value is not None else "?"))[:limit]
+    return text or "?"
 
 
 def scan():
@@ -618,6 +632,7 @@ def _claim_once(argv):
     my_pid = pid_override if pid_override is not None else session_pid()
     if project is None:
         project = os.path.basename(os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
+    project = safe_name(project)
 
     # The turn is machine-wide: the selected browser is shared by every agent session on this
     # machine, so two sessions in two different profiles still flip each other's target.
@@ -630,14 +645,14 @@ def _claim_once(argv):
             take = True; idle += f", over the {limit} min stuck threshold"
         if not take:
             print(f"HELD: the Chrome turn on this machine belongs to pid {other.get('pid')}, project "
-                  f"{other.get('project')}, in {other.get('profileName')} since {other.get('since')} "
+                  f"{safe_name(other.get('project'))}, in {safe_name(other.get('profileName'))} since {other.get('since')} "
                   f"({idle}). One session drives Chrome at a time. Queue for it: repeat "
                   f"`chrome-lanes claim {name!r} --wait 590` until it returns the turn, doing other "
                   f"work meanwhile. Use --force only if the user says so.",
                   file=sys.stderr)
             return 4
-        print(f"TAKEN OVER the Chrome turn from pid {other.get('pid')}, project {other.get('project')} "
-              f"({other.get('profileName')}, {idle})", file=sys.stderr)
+        print(f"TAKEN OVER the Chrome turn from pid {other.get('pid')}, project {safe_name(other.get('project'))} "
+              f"({safe_name(other.get('profileName'))}, {idle})", file=sys.stderr)
         _mark_taken(other, my_pid, project)
         try:
             os.remove(opath)
@@ -707,7 +722,7 @@ def cmd_release(argv):
     lease = read_lease(path)
     if lease and not is_mine(lease, my_pid) and lease_alive(lease) and not force:
         print(f"NOT YOURS: {row.get('profileName')} is held by pid {lease.get('pid')}, project "
-              f"{lease.get('project')}, from {lease.get('machine') or machine_name()} ({idle_text(lease)}). "
+              f"{safe_name(lease.get('project'))}, from {lease.get('machine') or machine_name()} ({idle_text(lease)}). "
               f"A live lease is released by its holder. Use `release {name!r} --force` only if the user "
               f"says so.", file=sys.stderr)
         return 4
@@ -736,9 +751,9 @@ def cmd_status(argv):
             continue
         if remote:
             print(f"{label} held from {machine} expires {lease.get('expires')} "
-                  f"project {lease.get('project')} since {lease.get('since')}")
+                  f"project {safe_name(lease.get('project'))} since {lease.get('since')}")
         else:
-            print(f"{label} pid {lease.get('pid')} alive project {lease.get('project')} "
+            print(f"{label} pid {lease.get('pid')} alive project {safe_name(lease.get('project'))} "
                   f"since {lease.get('since')} ({idle_text(lease)})")
     return 0
 
@@ -819,7 +834,7 @@ def taken_over_note():
     except OSError:
         pass
     return (f"CHROME LEASE TAKEN OVER: your claim on {info.get('profileName')} was taken by pid "
-            f"{info.get('by_pid')}, project {info.get('by_project')}, on {info.get('by_machine') or 'this machine'} "
+            f"{info.get('by_pid')}, project {safe_name(info.get('by_project'))}, on {info.get('by_machine') or 'this machine'} "
             f"(idle over {stale_minutes()} min, or forced). Do not drive Chrome now. Claim again with "
             f"`chrome-lanes claim <name> --wait 590`, or stop and ask the user.")
 
