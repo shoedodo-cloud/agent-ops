@@ -47,12 +47,13 @@ EOF
 STATE="${CONTEXT_HYGIENE_HOME:-$HOME/.config/context-hygiene}"
 LOG="$STATE/compaction.log"
 PROJ="${CLAUDE_PROJECT_DIR:-$PWD}"
+export PROJ   # read by awk through ENVIRON, so the path is compared as text, never as a regex
 MODE="${1:---log}"
 TAB=$(printf '\t')
 
 # grep -c prints "0" AND exits 1 on no match, so `|| echo 0` would emit it twice.
 count() {
-  _n=$(grep -c "${TAB}${PROJ}$" "$LOG" 2>/dev/null) || _n=0
+  _n=$(awk -F'\t' '$2 == ENVIRON["PROJ"] { n++ } END { print n + 0 }' "$LOG" 2>/dev/null) || _n=0
   printf '%s' "${_n:-0}" | tr -dc '0-9'
 }
 
@@ -76,7 +77,7 @@ case "$MODE" in
       echo "If you cannot re-read it, say that you are working from a summary."
       exit 0
     fi
-    LAST=$(grep "${TAB}${PROJ}$" "$LOG" 2>/dev/null | tail -1 | cut -f1)
+    LAST=$(awk -F'\t' '$2 == ENVIRON["PROJ"] { l = $1 } END { print l }' "$LOG" 2>/dev/null)
     echo "CONTEXT WAS COMPACTED. The log holds ${N} compaction(s) for $(basename "$PROJ"), counted across all sessions."
     echo "Most recent: ${LAST:-unknown}."
     echo "Everything before that point is a summary, not the verbatim conversation. Summaries of"

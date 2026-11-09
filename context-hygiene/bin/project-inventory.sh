@@ -82,10 +82,20 @@ set +f
 list_files() {
   if [ "${#PRUNE[@]}" -gt 0 ]; then
     find . -type d \( "${PRUNE[@]}" \) -prune -o \
-      -type f ! -name '.DS_Store' -exec stat "$STAT_FLAG" "$STAT_FMT" {} + 2>/dev/null
+      -type f ! -name '.DS_Store' ! -name '*[[:cntrl:]]*' -exec stat "$STAT_FLAG" "$STAT_FMT" {} + 2>/dev/null
   else
-    find . -type f ! -name '.DS_Store' -exec stat "$STAT_FLAG" "$STAT_FMT" {} + 2>/dev/null
+    find . -type f ! -name '.DS_Store' ! -name '*[[:cntrl:]]*' -exec stat "$STAT_FLAG" "$STAT_FMT" {} + 2>/dev/null
   fi
+}
+
+# Files whose names hold a newline or another control character are left out of the listing,
+# because such a name could print as extra lines of this report. They are counted instead.
+odd_names() {
+  if [ "${#PRUNE[@]}" -gt 0 ]; then
+    find . -type d \( "${PRUNE[@]}" \) -prune -o -type f -name '*[[:cntrl:]]*' -print0 2>/dev/null
+  else
+    find . -type f -name '*[[:cntrl:]]*' -print0 2>/dev/null
+  fi | tr -dc '\000' | wc -c | tr -d ' '
 }
 
 # One stat process per batch of files, not one per file.
@@ -113,6 +123,8 @@ show_rows() {
 
 echo "PROJECT INVENTORY  $DIR"
 echo "$TOTAL files. Newest first. Age is days since modified."
+ODD=$(odd_names)
+[ "${ODD:-0}" -gt 0 ] && echo "NOT LISTED: $ODD file(s) whose names contain a newline or control character."
 echo "---"
 printf '%s\n' "$ROWS" | head -n "$MAX" | show_rows
 [ "$TOTAL" -gt "$MAX" ] && echo "... $(( TOTAL - MAX )) more not shown. Re-run with a larger limit if needed."
