@@ -21,7 +21,7 @@ guards against happened at least once.
 ## Install
 
 ```sh
-git clone <repo-url>
+git clone https://github.com/shoedodo-cloud/agent-ops.git
 cd agent-ops
 ./install.sh job-health pull-gate
 ```
