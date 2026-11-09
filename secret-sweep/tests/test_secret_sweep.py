@@ -24,10 +24,18 @@ TOKENS = {
     "google-api-key": "AIza" + "f" * 35,
     "private-key-header": "-----BEGIN RSA " + "PRIVATE KEY-----",
     "generic-api-key": 'api_key = "' + "k9" * 12 + '"',
+    "linear-api-key": "lin_api_" + "g" * 40,
+    "stripe-live-key": "sk_" + "live_" + "h" * 24,
+    "gitlab-token": "glpat-" + "i" * 20,
+    "npm-token": "npm_" + "j" * 36,
+    "huggingface-token": "hf_" + "k" * 34,
+    "pypi-token": "pypi-" + "AgEIcHlwaS5vcmc" + "l" * 60,
+    "url-credentials": "https://alice:" + "m" * 12 + "@db.example.com/x",
 }
 # What must never appear in output for each token.
 SECRET_TEXT = dict(TOKENS)
 SECRET_TEXT["generic-api-key"] = "k9" * 12
+SECRET_TEXT["url-credentials"] = "m" * 12
 
 
 def load_tool():
@@ -141,7 +149,8 @@ def test_token_in_tracked_file_exits_1_and_prints_no_token_text(tmp_path, env, n
 
 
 @pytest.mark.parametrize("fname", [".env", ".env.production", "server.pem", "id_rsa",
-                                   "credentials.json", "my-token-list.txt", "deploy.key"])
+                                   "credentials.json", "my-token-list.txt", "deploy.key", ".npmrc", ".git-credentials",
+                                   "id_ecdsa", "vault.kdbx", "service-account-prod.json"])
 def test_credential_filename_exits_1(tmp_path, env, fname):
     repo = make_repo(tmp_path / "proj", env)
     (repo / fname).write_text("nothing secret in here\n")

@@ -58,7 +58,9 @@ The patterns live at the top of `bin/secret-sweep`, in `SECRET_FILE` and `CONTEN
 | `google-api-key` | `AIza` then 30 or more key characters |
 | `private-key-header` | a PEM private key header line (RSA, EC, OpenSSH or plain) |
 | `generic-api-key` | `api_key`, `api-key` or `apikey`, then `:` or `=`, then 20 or more key characters that include a digit. Optional quotes. Case-insensitive. |
-| `credential-filename` | `.env` and `.env.*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.p12`, `*.pfx`, `*.key`, `*credential*.json`, `*token*.txt`, `*.keychain`, `*.keychain-db` |
+| `linear-api-key` `stripe-live-key` `gitlab-token` `npm-token` `huggingface-token` `pypi-token` | `lin_api_`, `sk_live_`/`rk_live_`, `glpat-`, `npm_`, `hf_`, `pypi-AgEIcHlwaS5vcmc`, each then its key characters |
+| `url-credentials` | a password in a URL: `scheme://user:<password>@host`, password 6 or more characters |
+| `credential-filename` | `.env` and `.env.*`, `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `*.pem`, `*.p12`, `*.pfx`, `*.key`, `*credential*.json`, `*token*.txt`, `*.keychain`, `*.keychain-db`, `.npmrc`, `.netrc`, `.pypirc`, `.git-credentials`, `*.kdbx`, `*.jks`, `service-account*.json` |
 
 The placeholder files `.env.example`, `.env.sample`, `.env.template` and `.env.dist` are not
 reported by name. Their content is still scanned. The name patterns are broad on purpose, so
