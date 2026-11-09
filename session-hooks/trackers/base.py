@@ -116,3 +116,38 @@ class Tracker:
 
     def create_item(self, project: str, title: str, body: str) -> str:
         raise NotImplementedError
+
+
+# ------------------------------------------------------------ untrusted repo content ----
+_CONTROL = __import__("re").compile(r"[\x00-\x08\x0b-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def clean_text(text: str, limit: int = 200) -> str:
+    """One printable line from untrusted text (a note, a ledger line, an issue title).
+    Control and bidi characters become '?', so a value cannot forge extra lines or hide text."""
+    return _CONTROL.sub("?", " ".join(str(text).split()))[:limit]
+
+
+def escape_problem(path, root) -> str:
+    """Why a path that should sit inside the repo is unsafe to read or write, or "".
+
+    A cloned repo controls its own files. A symlinked notes folder or ledger would let it
+    point session-wrap's writes, or session-start's reads, at any file of the user's.
+    Only relative paths are checked: an absolute path came from the user's own setting."""
+    from pathlib import Path
+    root_p = Path(root)
+    path_p = Path(path)
+    try:
+        rel = path_p.relative_to(root_p)
+    except ValueError:
+        return ""                     # absolute path from the user's own config or env
+    cur = root_p
+    for part in rel.parts:
+        cur = cur / part
+        if cur.is_symlink():
+            return f"{cur.relative_to(root_p)} is a symlink inside the repo, refusing to follow it"
+    try:
+        path_p.resolve().relative_to(root_p.resolve())
+    except ValueError:
+        return f"{rel} resolves outside the repo, refusing to follow it"
+    return ""

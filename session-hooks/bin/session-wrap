@@ -217,6 +217,11 @@ def run(argv: list[str] | None = None, stdin=None) -> int:
     body = string.Template(template).safe_substitute(values)
 
     path = _note_path(folder, now)
+    from trackers.base import escape_problem
+    problem = escape_problem(folder, base)
+    if problem:
+        print(f"session-wrap: no note written: {problem}", file=sys.stderr)
+        return 1
     try:
         folder.mkdir(parents=True, exist_ok=True)
         with open(path, "x", encoding="utf-8") as handle:

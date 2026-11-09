@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from trackers.base import Context, Item, Tracker, TrackerError
+from trackers.base import Context, Item, Tracker, TrackerError, escape_problem
 
 DEFAULT_LEDGER = "notes/ledger.md"
 ITEM_RE = re.compile(r"^[-*] \[([ ~xX])\] \(([^)]*)\)\s*(.*)$")
@@ -63,7 +63,13 @@ class FileTracker(Tracker):
     def plan_post(self, project: str) -> str:
         return f"append an open item tagged ({project}) to {self.label}"
 
+    def _check_path(self) -> None:
+        problem = escape_problem(self.path, self.context.repo_root)
+        if problem:
+            raise TrackerError(problem)
+
     def open_items(self, project: str) -> List[Item]:
+        self._check_path()
         if not self.path.is_file():
             raise TrackerError(f"no ledger at {self.label}")
         try:
@@ -99,6 +105,7 @@ class FileTracker(Tracker):
 
     def _append(self, project: str, title: str, body_lines: List[str]) -> str:
         tag = _clean_tag(project)
+        self._check_path()
         existing: Optional[str] = None
         if self.path.exists():
             try:
