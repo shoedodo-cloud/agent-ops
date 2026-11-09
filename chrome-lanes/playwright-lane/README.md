@@ -45,7 +45,10 @@ That profile is signed out of everything unless you sign it in.
 - Refuses to start (exit 1, message on stderr) if that file is missing, empty, or not mode 600.
 - Exports it as `PLAYWRIGHT_MCP_EXTENSION_TOKEN`, never as a command-line argument.
 - Pins the server version in `PLAYWRIGHT_MCP_VERSION` and runs
-  `exec npx -y @playwright/mcp@$PLAYWRIGHT_MCP_VERSION --extension`.
+  `exec npx -y @playwright/mcp@$PLAYWRIGHT_MCP_VERSION --extension`. The version is pinned,
+  its dependencies are not, and npx may fetch them at a start. This server drives a real
+  Chrome, so for a stricter setup install it once with a lockfile (`npm ci` in a folder of
+  its own) and point the `exec` line at that folder's `node_modules/.bin/mcp-server-playwright`.
 
 ## Register it
 
